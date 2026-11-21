@@ -1,184 +1,260 @@
-"""Mech Royale entry point."""
+"""Mechfight strategy: build an early lead, then isolate opponents."""
 import math
-from pathlib import Path
-import sys
 
-# The container copies the wrapper alongside this file.
-sys.path.append(str(Path(__file__).parent / "mechfight-kit" / "python"))
 import mechfight as mf
+from arena import Arena
+from combat import Combat
+from movement import Movement, distance
 
 
-def distance(a, b):
-    return math.hypot(a[0] - b[0], a[1] - b[1])
-
-
-def angle_error(a, b):
-    return abs(math.remainder(a - b, math.tau))
+UPGRADES = {
+    "nanites": 9, "gun_mag": 8, "lightning_range": 8, "plating": 7,
+    "gun_damage": 6, "armor": 6, "lightning_efficiency": 6,
+    "mortar_reload": 6, "servos": 5, "laser_damage": 5, "mortar_splash": 5,
+    "laser_charge": 4, "jets": 4, "gun_velocity": 4, "gun_rate": 3,
+    "reactor": 3, "capacitor": 2, "sensors": 2, "gyros": 2,
+}
 
 
 class Bot:
-    name = "Oval Runner"
+    name = "Oval Runner II"
 
     def __init__(self, hello):
         self.config = hello["config"]
-        self.anchor = None
-        self.unstick_until = 0
-        self.was_moving = False
-        self.side = 1 if hello["slot"] % 2 else -1
-        self.last_gate = 0
+        self.arena = Arena(hello)
+        self.combat = Combat(hello, self.arena)
+        self.movement = Movement(hello, self.arena)
         self.recovering = False
+        self.hit_rate = 0
+        self.last_time = 0
+        self.last_bearing = None
+        self.last_damage = -100
+        self.combat_target = None
+        self.goal_id = None
+        self.loot = {}
+        self.explore_angle = (hello["slot"] / 16) * math.tau
+
+    def update(self, obs):
+        now = obs["t"]
+        dt = min(2, max(0, now - self.last_time))
+        self.hit_rate *= math.exp(-dt / 2.0)
+        self.last_time = now
+        for event in obs["events"]:
+            if event["type"] == "damaged" and event["weapon"] != "zone":
+                self.hit_rate += event["amount"] / 2.0
+                self.last_bearing = event["bearing"]
+                self.last_damage = now
+
+        visible = set()
+        for kind in ("cubes", "pickups", "crates"):
+            for item in obs[kind]:
+                visible.add(item["id"])
+                self.loot[item["id"]] = (kind, item, now)
+        pos = obs["self"]["pos"]
+        for key, (kind, item, seen) in list(self.loot.items()):
+            if key not in visible and (now - seen > 16 or distance(pos, item["pos"]) < 8):
+                del self.loot[key]
 
     def act(self, obs):
+        self.update(obs)
         me = obs["self"]
         pos = me["pos"]
         now = obs["t"]
         zone = obs["zone"]
         center = zone["next_center"]
-        radius = zone["next_radius"]
-        weapons = me["weapons"]
-        enemies = [actor for actor in obs["mechs"] if actor["kind"] == "mech"]
-        enemy = min(enemies, key=lambda actor: distance(pos, actor["pos"]) +
-                    45 * actor.get("hp", 1400) / max(1, actor.get("max_hp", 1400)),
-                    default=None)
-        nearest = min((distance(pos, actor["pos"]) for actor in enemies), default=math.inf)
-        separation = distance(pos, enemy["pos"]) if enemy else math.inf
-        hp_fraction = me["hp"] / me["max_hp"]
-        if hp_fraction < 0.42:
-            self.recovering = True
-        elif hp_fraction > 0.78:
+        guns = me["weapons"]
+        secondary = guns[1]
+        enemies = sorted((x for x in obs["mechs"] if x["kind"] == "mech"),
+                         key=lambda x: distance(pos, x["pos"]))
+        nearby = [x for x in enemies if distance(pos, x["pos"]) < 115]
+        nearest = distance(pos, enemies[0]["pos"]) if enemies else math.inf
+        previous_target = self.combat_target
+        candidate = self.combat.select(obs, enemies[:7], previous_target)
+        self.combat_target = candidate["id"] if candidate else None
+        hp = me["hp"] / me["max_hp"]
+        low = 0.50 if len(nearby) < 2 else 0.69
+        if zone["next_radius"] == 0:
             self.recovering = False
-        urgent = not me["in_zone"] or (
-            distance(pos, center) > radius - 10 and
-            distance(pos, center) - radius + 18 >
-            max(0, zone["shrink_end"] - now - 5) * me["stats"]["walk_speed"]
-        )
-        goal = center
+        elif hp < low or (hp < 0.83 and self.hit_rate * 4 > me["hp"]):
+            self.recovering = True
+        elif hp >= 0.85:
+            self.recovering = False
+
+        zone_goal, urgent = self.zone_goal(obs)
         action = {}
-        reach = self.config["loot"]["pickup_radius"]
-        ratings = {"gun": 0, "mortar": 0, "laser": 3 if radius > 70 else 2,
-                   "lightning": 2 if radius > 70 else 3}
-        held = {weapon["kind"] for weapon in weapons if weapon}
-        pickups = [
-            item for item in obs["pickups"]
-            if item["kind"] not in held and ratings[item["kind"]] >
-            (ratings[weapons[1]["kind"]] if weapons[1] else 0)
-            and abs(item["pos"][2] - pos[2]) <= 4
-        ]
-        pickup = min(pickups, key=lambda item: distance(pos, item["pos"]), default=None)
-        if pickup and distance(pos, pickup["pos"]) < reach:
-            action["take"] = pickup["id"]
-            if weapons[1]:
-                if weapons[1].get("charge", 0):
-                    action.pop("take")
-                else:
-                    action["drop"] = 1
-        if not urgent:
-            objectives = []
-            if nearest > 45:
-                objectives.extend((distance(pos, item["pos"]) - 18, item["pos"])
-                                  for item in obs["cubes"]
-                                  if abs(item["pos"][2] - pos[2]) < 4)
-                if pickup and distance(pos, pickup["pos"]) < 55:
-                    objectives.append((distance(pos, pickup["pos"]) - 12, pickup["pos"]))
-                if not self.recovering and nearest > 100 and me["cubes"] < 10:
-                    objectives.extend((distance(pos, crate["pos"]) + 18, crate["pos"])
-                                      for crate in obs["crates"]
-                                      if distance(pos, crate["pos"]) < 65
-                                      and abs(crate["pos"][2] - pos[2]) < 4)
-                for drop in obs["drops"]:
-                    d = distance(pos, drop["pos"])
-                    if d < 105 and drop["holder"] in (None, me["id"]) and drop["lands_in"] < 8:
-                        objectives.append((d * 0.65 - 45, drop["pos"]))
-            if objectives:
-                goal = min(objectives, key=lambda item: item[0])[1]
-            elif distance(pos, center) < max(8, radius * 0.65):
-                goal = pos
-
-        move_yaw = math.atan2(goal[1] - pos[1], goal[0] - pos[0])
-        moving = distance(pos, goal) > 3
-        if separation < 115 and not urgent:
-            bearing = math.atan2(enemy["pos"][1] - pos[1], enemy["pos"][0] - pos[0])
-            preferred = 30 if "lightning" in held else 65
-            retreat = self.recovering or separation < preferred - 12
-            close = separation > preferred + 12 and len(enemies) <= 1
-            move_yaw = bearing + self.side * (2.65 if retreat else 0.85 if close else 1.57)
-            moving = True
-        if self.anchor is None or now - self.last_gate >= 0.8:
-            if self.anchor and self.was_moving and moving and distance(pos, self.anchor) < 2:
-                self.unstick_until = now + 1.25
-                self.side *= -1
-            self.anchor = pos
-            self.last_gate = now
-            self.was_moving = moving
-        unsticking = moving and now < self.unstick_until
-        if unsticking:
-            move_yaw += self.side * 1.05
-        action["move"] = [math.cos(move_yaw), math.sin(move_yaw)] if moving else [0, 0]
-        action["boost"] = moving and (
-            (me["grounded"] and me["energy"] > 25 and
-             (urgent or separation < 28 or self.recovering and separation < 100))
-            or (unsticking and not me["grounded"] and me["energy"] > 35)
-        )
-        action["jump"] = unsticking and me["grounded"]
-
-        target = enemy
-        if not target and not urgent and not self.recovering:
-            farm = list(obs["crates"])
-            farm.extend(actor for actor in obs["mechs"] if actor["kind"] == "npc")
-            target = min(farm, key=lambda item: distance(pos, item["pos"]) +
-                         (12 if item["id"] >= 1000 else 0), default=None)
-            if target and distance(pos, target["pos"]) > 50:
-                target = None
-        self.aim_and_fire(action, me, target, move_yaw if moving else me["aim"][0] + 0.16)
-        if self.recovering and separation > 50:
-            action["fire"] = [False, False]
         if obs["offer"]:
-            priorities = {"armor": 5, "gun_rate": 4, "sensors": 2}
-            action["pick"] = max(range(len(obs["offer"]["choices"])),
-                                 key=lambda i: priorities.get(obs["offer"]["choices"][i]["id"], 1))
+            choices = obs["offer"]["choices"]
+            action["pick"] = max(range(len(choices)), key=lambda i: UPGRADES.get(choices[i]["id"], 0))
+        ratings = self.weapon_ratings(obs, enemies)
+        rating = ratings[secondary["kind"]] if secondary else 0
+        reach = self.config["loot"]["pickup_radius"]
+        options = [p for p in obs["pickups"] if p["kind"] != "gun"
+                   and ratings[p["kind"]] > rating + (0.8 if secondary else 0)
+                   and distance(pos, p["pos"]) < reach and abs(p["pos"][2] - pos[2]) < 4]
+        if options and not (secondary and secondary.get("charge", 0)):
+            action["take"] = max(options, key=lambda p: ratings[p["kind"]])["id"]
+            if secondary:
+                action["drop"] = 1
+
+        goal, farm_target, mode = self.objective(obs, zone_goal, urgent, nearby, ratings, rating)
+        enemy_distance = distance(pos, candidate["pos"]) if candidate else math.inf
+        ally_pressure = len(nearby) >= 2
+        easy_finish = candidate and candidate.get("hp", 1400) < 230 and enemy_distance < 85
+        can_finish = easy_finish and hp > 0.22 and not (ally_pressure and self.hit_rate > 120)
+        fighting = candidate and enemy_distance < (165 if candidate["id"] == previous_target else 145)
+        evasive = bool(zone["next_radius"] > 0 and
+                       (self.recovering or ally_pressure and self.hit_rate > 85) and not can_finish)
+        committed_drop = mode == "drop" and (
+            distance(pos, goal) < 6 and hp > 0.28
+            or distance(pos, goal) < 37 and nearest > 35 and hp < 0.8
+        )
+        seeking_gear = mode == "weapon" and not secondary and nearest > 38
+        if committed_drop or seeking_gear and hp > 0.36:
+            # A nearby repair or first secondary can flip an opening duel.
+            pass
+        elif not urgent and (fighting or nearby):
+            if evasive or fighting and (mode not in ("cube", "weapon") or nearest < 44):
+                opponent = candidate if candidate is not None else nearby[0]
+                weapon_range = secondary["stats"]["range"] if secondary and secondary["kind"] == "lightning" else None
+                preferred = weapon_range * 0.79 if weapon_range and me["energy"] > 15 else 67
+                if secondary and secondary["kind"] == "mortar":
+                    preferred = 51
+                if not weapon_range and "lightning" in opponent.get("weapons", ()):
+                    preferred = max(preferred, 62)
+                if can_finish:
+                    preferred = min(preferred, 43)
+                goal = self.movement.engage(obs, opponent, preferred, evasive, zone_goal)
+                mode = "retreat" if evasive else "fight"
+        elif evasive and nearest < 150 and not urgent:
+            goal = self.movement.engage(obs, enemies[0], 70, True, zone_goal)
+            mode = "retreat"
+        elif evasive and not urgent and self.last_bearing is not None and now - self.last_damage < 2:
+            # Canopy or a wall can hide the attacker even just after a hit.
+            bearing = self.last_bearing + 0.36 * self.movement.side
+            goal = (pos[0] - 28 * math.cos(bearing), pos[1] - 28 * math.sin(bearing), pos[2])
+            mode = "retreat"
+
+        self.movement.apply(action, obs, goal, mode, nearby)
+        target = candidate or farm_target
+        allow_fire = not evasive or committed_drop
+        if not allow_fire and nearest < 24 and hp > 0.16:
+            allow_fire = True
+        if not allow_fire:
+            target = None
+        if target is None and self.last_bearing is not None and now - self.last_damage < 1.6:
+            scan = self.last_bearing
+        elif goal is not None and distance(pos, goal) > 5:
+            scan = math.atan2(goal[1] - pos[1], goal[0] - pos[0]) + 0.50 * math.sin(now * 1.25)
+        else:
+            scan = me["aim"][0] + 0.31
+        self.combat.apply(action, obs, target, scan, allow_fire)
         return action
 
-    def aim_and_fire(self, action, me, target, scan_yaw):
-        weapons = me["weapons"]
-        action["aim"] = [math.remainder(scan_yaw, math.tau), 0]
-        action["fire"] = [False, False]
-        if not target:
-            action["reload"] = any(w and w["kind"] == "gun" and 0 < w["ammo"] < w["stats"]["mag"]
-                                   for w in weapons)
-            return
+    def weapon_ratings(self, obs, enemies):
+        small = obs["zone"]["next_radius"] <= 70
+        has_mortar_enemy = any("mortar" in e.get("weapons", ()) for e in enemies[:3])
+        ratings = {"gun": 0, "mortar": 5.1, "laser": 4.4, "lightning": 6.0}
+        if small:
+            ratings["lightning"] += 2
+        elif has_mortar_enemy:
+            ratings["laser"] += 1.6
+        for upgrade in obs["self"]["upgrades"]:
+            prefix = upgrade.split("_", 1)[0]
+            if prefix in ratings and prefix != "gun":
+                ratings[prefix] += 0.65
+        return ratings
+
+    @staticmethod
+    def zone_goal(obs):
+        zone = obs["zone"]
+        me = obs["self"]
         pos = me["pos"]
-        d = distance(pos, target["pos"])
-        secondary = weapons[1]
-        instant = secondary and d < secondary["stats"]["range"] and (
-            secondary["kind"] == "lightning" or
-            secondary["kind"] == "laser" and (secondary["cooldown"] <= 0.1 or secondary.get("charge", 0))
+        now = obs["t"]
+        zone_room = zone["radius"] - distance(pos, zone["center"])
+        center = zone["next_center"]
+        radius = zone["next_radius"]
+        d = distance(pos, center)
+        speed = me["stats"]["walk_speed"] * 0.62
+        required = max(0, d - max(0, radius - 18)) / speed
+        urgent = (
+            not me["in_zone"]
+            or zone_room < (12 if now >= zone["shrink_start"] else 1)
+            or required > max(3, zone["shrink_end"] - now - 12)
+            or radius == 0 and zone["shrink_end"] - now < 10
         )
-        gun = weapons[0]
-        lead = 0.05 if instant else 0.05 + d / gun["stats"]["speed"]
-        velocity = target.get("vel", (0, 0, 0))
-        dx, dy, dz = (target["pos"][i] + velocity[i] * lead - pos[i] for i in range(3))
-        height = 4.5 * (1 + 0.05 * target.get("cubes", 0)) if target.get("kind") == "mech" else 1.5
-        yaw = math.atan2(dy, dx)
-        pitch = math.atan2(dz + height - me["stats"]["muzzle_height"], math.hypot(dx, dy))
-        action["aim"] = [yaw, pitch]
-        error = angle_error(yaw, me["aim"][0])
-        tolerance = math.atan2(2.0, max(1, d))
-        aligned = error < tolerance and abs(pitch - me["aim"][1]) < tolerance
-        gun_dx = dx + (velocity[0] * d / gun["stats"]["speed"] if instant else 0)
-        gun_dy = dy + (velocity[1] * d / gun["stats"]["speed"] if instant else 0)
-        gun_yaw = math.atan2(gun_dy, gun_dx)
-        # The action can keep its current aim at the first simulation tick,
-        # then slew toward the new aim before the second one.
-        gun_error = max(angle_error(gun_yaw, me["aim"][0]), angle_error(gun_yaw, yaw))
-        action["fire"][0] = (gun_error < tolerance and abs(pitch - me["aim"][1]) < tolerance
-                             and d < gun["stats"]["range"])
-        if instant and secondary["kind"] == "lightning":
-            action["fire"][1] = error < math.radians(secondary["stats"]["cone_deg"]) * 0.45 and me["energy"] > 10
-        elif instant and secondary["kind"] == "laser":
-            charge = secondary.get("charge", 0)
-            action["fire"][1] = (charge > 0 or error < 0.24) and not (
-                charge >= secondary["stats"]["charge"] - 0.025 and aligned
-            )
+        if d <= 2 or radius <= 15:
+            return center, urgent
+        inner = 0 if radius <= 25 else max(0, radius - (42 if urgent else 75))
+        ratio = min(d, inner) / d
+        return (center[0] + (pos[0] - center[0]) * ratio,
+                center[1] + (pos[1] - center[1]) * ratio), urgent
+
+    def objective(self, obs, zone_goal, urgent, nearby, ratings, current_weapon):
+        me = obs["self"]
+        pos = me["pos"]
+        zone = obs["zone"]
+        if urgent:
+            self.goal_id = None
+            return zone_goal, None, "zone"
+        candidates = []
+        hp = me["hp"] / me["max_hp"]
+        now = obs["t"]
+        vision_range = 125
+        can_farm = not self.recovering and len(nearby) < 2 and self.hit_rate < 35 and me["cubes"] < 10
+
+        def add(identity, point, mode, value, actor=None, radius=vision_range):
+            d = distance(pos, point)
+            if d > radius or distance(point, zone["center"]) > zone["radius"] - 8:
+                return
+            if mode != "drop" and abs(point[2] - pos[2]) > 5:
+                return
+            threat = min((distance(point, e["pos"]) for e in nearby), default=150)
+            danger = max(0, 38 - threat) * (2.6 if self.recovering else 1.25)
+            commitment = 9 if identity == self.goal_id else 0
+            score = value + commitment - d - danger
+            candidates.append((score, identity, point, mode, actor))
+
+        for key, (kind, item, seen) in self.loot.items():
+            if kind == "cubes":
+                add(key, item["pos"], "cube", 61 if me["cubes"] < 10 else 30, radius=74)
+            elif kind == "pickups":
+                value = ratings[item["kind"]]
+                if item["kind"] != "gun" and value > current_weapon + (0.8 if current_weapon else 0):
+                    add(key, item["pos"], "weapon", 127 if not current_weapon else 42,
+                        radius=127 if not current_weapon else 90)
+            elif can_farm and now - seen < 5:
+                add(key, item["pos"], "farm", 41 + 0.061 * (300 - item.get("hp", 300)), item, radius=87)
+
+        if can_farm:
+            for npc in obs["mechs"]:
+                if npc["kind"] == "npc":
+                    add(npc["id"], npc["pos"], "farm", 65 + 0.07 * (350 - npc.get("hp", 350)), npc, radius=90)
+        for drop in obs["drops"]:
+            d = distance(pos, drop["pos"])
+            if drop["lands_in"] <= d / max(1, me["stats"]["walk_speed"]) + 8 and drop["holder"] in (None, me["id"]):
+                add(drop["id"], drop["pos"], "drop", 115 + 60 * (1 - hp) + 18 * drop["progress"], radius=185)
+
+        if candidates:
+            score, self.goal_id, point, mode, target = max(candidates, key=lambda item: item[0])
+            if score > -19:
+                if self.recovering and mode == "farm":
+                    return None, None, "idle"
+                return point, target, mode
+        self.goal_id = None
+        if self.recovering:
+            return None, None, "idle"
+        if distance(pos, zone_goal) > 20:
+            return zone_goal, None, "travel"
+        if zone["next_radius"] < 55:
+            return zone["next_center"], None, "travel"
+        if me["cubes"] < 10 and not nearby:
+            # Explore in persistent bursts so the forward vision wedge finds loot.
+            angle = self.explore_angle + math.floor(now / 9) * 1.49
+            point = (pos[0] + 46 * math.cos(angle), pos[1] + 46 * math.sin(angle), pos[2])
+            if distance(point, zone["next_center"]) < zone["next_radius"] - 25:
+                return point, None, "travel"
+            return zone["next_center"], None, "travel"
+        return None, None, "idle"
 
 
 if __name__ == "__main__":
