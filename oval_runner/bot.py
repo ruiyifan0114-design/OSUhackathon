@@ -1,29 +1,73 @@
 """Choose one match intent, then steer and shoot for it."""
 import math
 
-import mechfight as mf
 from arena import Arena
+from awareness import Awareness
 from combat import Combat
 from movement import Movement, distance
+import mechfight as mf
 
 
-UPGRADES = {
-    "nanites": 9, "gun_mag": 8, "lightning_range": 8, "plating": 7,
-    "gun_damage": 6, "armor": 6, "lightning_efficiency": 6,
-    "mortar_reload": 6, "servos": 5, "laser_damage": 5, "mortar_splash": 5,
-    "laser_charge": 4, "jets": 4, "gun_velocity": 4, "gun_rate": 3,
-    "reactor": 3, "capacitor": 2, "sensors": 2, "gyros": 2,
+# Value of one upgrade effect, keyed by the effect path from hello.config.
+# Effects are additive here: a two-effect upgrade gets the sum of its parts.
+# This is deliberately path-based so new ids or rebalanced descriptions do
+# not silently become zero-value choices.
+UPGRADE_PATH_VALUE = {
+    "mech.hp": 7.2,
+    "mech.armor": 6.2,
+    "mech.walk_speed": 2.6,
+    "mech.boost_speed": 2.6,
+    "mech.energy": 2.0,
+    "mech.energy_regen": 2.5,
+    "mech.boost_drain": 1.4,
+    "mech.jet_drain": 1.4,
+    "mech.regen_per_s": 5.0,
+    "mech.regen_delay": 2.0,
+    "mech.turn_rate": 2.4,
+    "mech.pitch_rate": 1.8,
+    "mech.near_range_bonus": 2.6,
+    "mech.vision_bonus": 1.8,
+    "mech.hearing": 2.2,
+    "weapons.gun.damage": 5.0,
+    "weapons.gun.cooldown": 5.0,
+    "weapons.gun.speed": 2.0,
+    "weapons.gun.range": 1.5,
+    "weapons.gun.mag": 3.5,
+    "weapons.gun.reload": 3.0,
+    "weapons.mortar.splash_radius": 3.0,
+    "weapons.mortar.cooldown": 4.5,
+    "weapons.mortar.speed": 2.0,
+    "weapons.laser.charge": 3.5,
+    "weapons.laser.damage": 6.0,
+    "weapons.laser.pierce": 5.0,
+    "weapons.lightning.chain": 6.0,
+    "weapons.lightning.range": 5.0,
+    "weapons.lightning.cone_deg": 2.0,
+    "weapons.lightning.energy": 4.0,
+    "weapons.lightning.damage": 2.0,
+}
+
+# Small situational corrections for effects whose value is not captured by
+# their stat path alone.
+UPGRADE_ID_BONUS = {
+    "nanites": 0.8,
+    "sensors": 0.6,
+    "plating": 0.4,
+    "lightning_chain": 0.8,
+    "laser_pierce": 0.5,
 }
 
 
 class Bot:
-    name = "Oval Runner III"
+    name = "Oval Runner IV"
 
     def __init__(self, hello):
         self.config = hello["config"]
         self.arena = Arena(hello)
         self.combat = Combat(hello, self.arena)
         self.movement = Movement(hello, self.arena)
+        self.awareness = Awareness(hello)
+        self.upgrade_defs = {item["id"]: item for item in self.config.get("upgrades", ())}
         self.recovering = False
         self.hit_rate = 0
         self.last_time = 0
@@ -38,18 +82,22 @@ class Bot:
         self.cover_cache = None
         self.first_weapon = self.first_kill = None
         self.damage_done = self.damage_taken = self.kills = 0
+        self.laser_cooldown = {}
+        self.last_attacker = None
 
     def update(self, obs):
         now = obs["t"]
         dt = min(2, max(0, now - self.last_time))
         self.hit_rate *= math.exp(-dt / 2.0)
         self.last_time = now
+        self.awareness.update(obs)
         for event in obs["events"]:
             kind = event["type"]
             if kind == "damaged" and event["weapon"] != "zone":
                 self.hit_rate += event["amount"] / 2.0
                 self.damage_taken += event["amount"]
                 self.last_bearing = event["bearing"]
+                self.last_attacker = event.get("by")
                 self.last_damage = now
             elif kind == "hit" and event["target"] < 16:
                 self.damage_done += event["amount"]
@@ -59,6 +107,9 @@ class Bot:
                     self.first_kill = now
             elif kind == "took" and event["kind"] != "gun" and self.first_weapon is None:
                 self.first_weapon = now
+        for beam in obs["beams"]:
+            if beam["kind"] == "laser":
+                self.laser_cooldown[beam["by"]] = now - beam["age"] + self.config["weapons"]["laser"]["cooldown"]
 
         visible = set()
         for kind in ("cubes", "pickups", "crates"):
@@ -79,9 +130,14 @@ class Bot:
         secondary = me["weapons"][1]
         enemies = sorted((x for x in obs["mechs"] if x["kind"] == "mech"),
                          key=lambda x: distance(pos, x["pos"]))
-        nearby = [x for x in enemies if distance(pos, x["pos"]) < 115]
+        nearby = [x for x in enemies if distance(pos, x["pos"]) < 140]
         zone_goal, urgent = self.zone_goal(obs)
-        danger, exposed = self.pressure(obs, nearby)
+        threats = self.threats(obs, nearby)
+        alert = self.awareness.alert(now)
+        sound_pressure = alert.score(now) if alert is not None else 0.0
+        danger = max(self.hit_rate, sum(rate for rate, _, _ in threats),
+                     sound_pressure * 0.55)
+        exposed = len(threats)
         hp_fraction = me["hp"] / me["max_hp"]
         if zone["next_radius"] == 0 and zone["shrink_end"] - now < 8:
             self.recovering = False
@@ -92,72 +148,146 @@ class Bot:
 
         action = {}
         if obs["offer"]:
-            choices = obs["offer"]["choices"]
-            action["pick"] = max(range(len(choices)), key=lambda i: UPGRADES.get(choices[i]["id"], 0))
+            action["pick"] = self.choose_upgrade(obs)
         ratings = self.weapon_ratings(obs, enemies)
         rating = ratings[secondary["kind"]] if secondary else 0
         reach = self.config["loot"]["pickup_radius"]
         options = [p for p in obs["pickups"] if p["kind"] != "gun"
                    and ratings[p["kind"]] > rating + (0.8 if secondary else 0)
                    and distance(pos, p["pos"]) < reach and abs(p["pos"][2] - pos[2]) < 4]
-        if options and not (secondary and secondary.get("charge", 0)):
+        safe_swap = not secondary or danger < 115 and not secondary.get("charge", 0)
+        if options and safe_swap:
             action["take"] = max(options, key=lambda p: ratings[p["kind"]])["id"]
             if secondary:
                 action["drop"] = 1
 
         goal, mode, target, ring = self.plan(
-            obs, enemies, nearby, danger, exposed, zone_goal, urgent, ratings, rating
+            obs, enemies, nearby, threats, danger, zone_goal, urgent,
+            ratings, rating, alert,
         )
-        if mode in ("fight", "finish"):
+        if mode in ("fight", "finish", "breakout"):
             self.combat_target = target["id"]
         else:
             self.combat_target = None
         if target is None and self.last_bearing is not None and now - self.last_damage < 1.6:
             scan = self.last_bearing
+        elif target is None and alert is not None and alert.age(now) < 2.5:
+            # The vision wedge does not cover behind us.  Turn the torso toward
+            # the strongest recent sound and let the next observation confirm
+            # whether it was a mech, loot, or scenery.
+            scan = alert.bearing
         elif goal is not None and distance(pos, goal) > 5:
             scan = math.atan2(goal[1] - pos[1], goal[0] - pos[0]) + 0.50 * math.sin(now * 1.25)
         else:
             scan = me["aim"][0] + 0.31
-        self.combat.apply(action, obs, target, scan, allow_new_charge=mode != "zone")
-        if secondary and secondary["kind"] == "laser" and mode == "zone":
-            # Release an existing charge instead of slowing the zone rotation.
+        escaping = mode in ("zone", "retreat", "breakout")
+        self.combat.apply(action, obs, target, scan, allow_new_charge=not escaping)
+        if target is None and not escaping and alert is not None:
+            self.blind_lightning(action, obs, alert)
+        if secondary and secondary["kind"] == "laser" and escaping:
             action["fire"][1] = False
-        self.movement.apply(action, obs, goal, mode, nearby, ring=ring)
+        steering_mode = "retreat" if mode == "breakout" else mode
+        self.movement.apply(action, obs, goal, steering_mode, nearby,
+                            ring=ring, target=target, alert=alert)
         self.trace(obs, mode, target)
         return action
 
-    def pressure(self, obs, nearby):
+    def choose_upgrade(self, obs):
+        """Pick the offer with the best config-derived marginal value."""
+        choices = obs["offer"]["choices"]
+        held = {weapon["kind"] for weapon in obs["self"]["weapons"] if weapon}
+        return max(
+            range(len(choices)),
+            key=lambda index: self.upgrade_score(choices[index], held),
+        )
+
+    def upgrade_score(self, choice, held):
+        definition = self.upgrade_defs.get(choice["id"], choice)
+        score = 0.0
+        for effect in definition.get("effects", ()):
+            score += UPGRADE_PATH_VALUE.get(effect.get("path"), 0.0)
+        score += UPGRADE_ID_BONUS.get(choice["id"], 0.0)
+        requires = definition.get("requires")
+        if requires and requires not in held:
+            # The protocol currently offers weapon upgrades only for held
+            # weapons, but keep the valuation safe if that changes.
+            score *= 0.20
+        return score if score > 0 else 1.0
+
+    def blind_lightning(self, action, obs, alert):
+        """Use a close sound as a coarse target for the wide lightning cone."""
+        me = obs["self"]
+        if alert.age(obs["t"]) > 0.75 or alert.distance > 44:
+            return
+        if alert.kind not in ("gun", "mortar", "laser", "laser_charge",
+                              "lightning", "step", "boost", "jet"):
+            return
+        secondary = me["weapons"][1]
+        if secondary is None or secondary["kind"] != "lightning":
+            return
+        stats = secondary["stats"]
+        if (secondary.get("cooldown", 0) > 0.15
+                or me["energy"] < stats["energy"] + 18):
+            return
+        error = abs(math.remainder(alert.bearing - me["aim"][0], math.tau))
+        if error > math.radians(stats["cone_deg"]) * 0.36:
+            return
+        origin = (me["pos"][0], me["pos"][1], me["pos"][2] + me["stats"]["muzzle_height"])
+        contact = alert.point(me["pos"])
+        contact = (contact[0], contact[1], me["pos"][2] + 4.5)
+        if not self.arena.clear(origin, contact):
+            return
+        action["aim"] = [alert.bearing, 0.0]
+        action["fire"][1] = True
+
+    def threats(self, obs, nearby):
+        """Rank exposed opponents by sustained pressure and telegraphed burst."""
         me = obs["self"]
         pos = me["pos"]
         body = (pos[0], pos[1], pos[2] + me["stats"]["height"] * 0.6)
-        visible_dps = 0
-        exposed = 0
+        threats = []
+        weapons = self.config["weapons"]
+        cubes = self.config["cubes"]
+        now = obs["t"]
         for foe in nearby[:5]:
             x, y, z = foe["pos"]
             d = distance(pos, foe["pos"])
             if not self.arena.clear((x, y, z + 7), body):
                 continue
-            exposed += 1
             yaw = math.atan2(pos[1] - y, pos[0] - x)
-            facing = 1.0 if abs(math.remainder(foe["aim"][0] - yaw, math.tau)) < 0.8 else 0.55
+            turn = abs(math.remainder(foe["aim"][0] - yaw, math.tau))
+            facing = 1.0 if turn < 0.55 else 0.60
             kinds = foe.get("weapons", ())
-            dps = max(12, 86 - d * 0.50)
-            if "lightning" in kinds and d < 53:
-                dps += 150
+            rate = max(12, 86 - d * 0.50)
+            burst = 0.0
+            arc_range = weapons["lightning"]["range"]
+            if "lightning" in kinds and d < arc_range * 1.22:
+                rate += 154 if d < arc_range else 82
             if "laser" in kinds:
-                dps += 115 if foe.get("charging") else 58
+                if foe.get("charging"):
+                    burst = weapons["laser"]["damage"] * (0.73 if turn < 0.4 else 0.35)
+                elif now >= self.laser_cooldown.get(foe["id"], 0):
+                    rate += 58
             if "mortar" in kinds:
-                dps += 65 if d < 75 else 28
-            visible_dps += dps * facing
-        return max(visible_dps, self.hit_rate), exposed
+                rate += 65 if d < 75 else 28
+            scale = (1 + cubes["damage_per_cube"] * min(cubes["stat_cap"], foe.get("cubes", 0)))
+            scale *= 1 - me["stats"].get("armor", 0)
+            threats.append((rate * facing * scale, burst * scale, foe))
+        recent_attacker = self.last_attacker if now - self.last_damage < 1 else None
+        return sorted(threats, key=lambda entry: entry[0] + entry[1] +
+                      (25 if entry[2]["id"] == recent_attacker else 0), reverse=True)
 
-    def plan(self, obs, enemies, nearby, danger, exposed, zone_goal, urgent, ratings, rating):
+    def plan(self, obs, enemies, nearby, threats, danger, zone_goal, urgent,
+             ratings, rating, alert):
         me = obs["self"]
         pos = me["pos"]
+        now = obs["t"]
+        zone = obs["zone"]
         secondary = me["weapons"][1]
         hp = me["hp"]
         nearest = distance(pos, enemies[0]["pos"]) if enemies else math.inf
         goal, resource, mode = self.objective(obs, zone_goal, urgent, nearby, ratings, rating)
+        exposed = len(threats)
 
         # Spend the short-horizon combat estimate on nearby, plausible opponents.
         ranked = []
@@ -169,21 +299,34 @@ class Bot:
             if not math.isfinite(estimate.first_shot):
                 continue
             stick = 10 if foe["id"] == self.combat_target else 0
+            foe_hp = foe.get("hp") or foe.get("max_hp") or 1400
+            foe_max = foe.get("max_hp") or 1400
+            wounded = 1 - min(1.0, foe_hp / max(1.0, foe_max))
+            revenge = 8 if foe["id"] == self.last_attacker and now - self.last_damage < 3 else 0
             score = (0.58 * estimate.damage_1s + 165 / (0.75 + estimate.kill_time)
-                     - 0.29 * d - 19 * min(2, estimate.first_shot) + stick)
+                     - 0.29 * d - 19 * min(2, estimate.first_shot)
+                     + 34 * wounded + revenge + stick)
             ranked.append((score, foe, estimate))
         _, target, estimate = max(ranked, key=lambda item: item[0], default=(0, None, None))
         if urgent:
             return zone_goal, "zone", target, None
 
-        reserve = me["max_hp"] * (0.10 if obs["alive"] == 2 else 0.18)
-        finish = max(
-            (entry for entry in ranked if entry[2].kill_time <= 1.9
-             and hp - danger * (entry[2].kill_time + 0.32) > reserve),
-            key=lambda entry: entry[0], default=None,
-        )
+        reserve = me["max_hp"] * (0.09 if obs["alive"] <= 3 else 0.16)
+        burst = sum(amount for _, amount, _ in threats)
+        rate_by_id = {foe["id"]: rate for rate, _, foe in threats}
+        finish = None
+        best_finish = -math.inf
+        for score, foe, eta in ranked:
+            if eta.kill_time > 2.3:
+                continue
+            # Count incoming fire until the kill, then only fire from survivors.
+            remaining_rate = max(0, danger - rate_by_id.get(foe["id"], 0))
+            loss = danger * eta.kill_time + remaining_rate * 0.55 + burst
+            utility = score - 0.43 * loss - 30 * eta.kill_time
+            if hp - loss > reserve and utility > best_finish:
+                best_finish, finish = utility, (foe, eta)
         if finish:
-            foe, eta = finish[1:]
+            foe, eta = finish
             # Stay in the firing lane for a shot already available; intercept only a fleeing target.
             d = distance(pos, foe["pos"])
             chase = eta.first_shot > 0.32 and d > 31
@@ -199,8 +342,16 @@ class Bot:
                 return goal, "drop", target, (drop["pos"], drop["radius"])
             mode, goal, resource = "travel", zone_goal, None
 
-        if self.recovering:
-            immediate = nearby or (enemies[:1] if nearest < 150 and obs["t"] - self.last_damage < 3 else ())
+        own_burst = estimate.damage_1s if estimate else 0
+        outmatched = (exposed >= 2 and hp < me["max_hp"] * 0.86
+                      and danger + burst * 0.6 > 95 + own_burst * 1.27)
+        reloading = (exposed > 0 and nearest < 70 and estimate is not None
+                     and estimate.first_shot > 0.65 and hp < danger * 3 + burst
+                     and obs["self"]["weapons"][0].get("reload", 0) > 0.45)
+        if self.recovering or outmatched or reloading:
+            immediate = [foe for _, _, foe in threats] or nearby
+            if not immediate and nearest < 170 and obs["t"] - self.last_damage < 3:
+                immediate = enemies[:1]
             cover = self.retreat_cover(obs, immediate, zone_goal)
             freshly_hit = obs["t"] - self.last_damage < 1.8
             if cover is None and immediate and (exposed or freshly_hit or not me["in_zone"]):
@@ -208,7 +359,32 @@ class Bot:
             if not immediate and self.last_bearing is not None and obs["t"] - self.last_damage < 1.4:
                 bearing = self.last_bearing
                 cover = (pos[0] - 24 * math.cos(bearing), pos[1] - 24 * math.sin(bearing), pos[2])
+            elif not immediate and alert is not None and alert.age(now) < 2.0:
+                # No visible attacker, but a close sound still justifies
+                # opening distance while the torso scans toward it.
+                bearing = alert.bearing
+                cover = (pos[0] - 20 * math.cos(bearing), pos[1] - 20 * math.sin(bearing), pos[2])
+            # Trading can still win if we're already pinned, but suppress fire once
+            # the lane is broken so we can complete the repair delay.
+            if (target is not None and nearest < 24 and freshly_hit and exposed
+                    and estimate.first_shot <= 0.28 and estimate.damage_1s > 90
+                    and (cover is None or distance(pos, cover) > me["stats"]["walk_speed"] * 0.9)
+                    and hp < danger * 2.0 + burst):
+                return cover, "breakout", target, None
             return cover, "retreat", None, None
+
+        # An unseen close sound is evidence, not a target.  Do not keep farming
+        # or walking into it; back off while the scan layer looks toward it.
+        unseen_close = (
+            alert is not None and not threats and alert.age(now) < 1.8
+            and alert.distance < 120 and alert.score(now) > 30
+        )
+        if unseen_close and not urgent and mode in ("farm", "travel", "idle", "weapon", "cube"):
+            bearing = alert.bearing
+            away = (pos[0] - 18 * math.cos(bearing),
+                    pos[1] - 18 * math.sin(bearing), pos[2])
+            if distance(away, zone["center"]) < zone["radius"] - 10:
+                return away, "caution", None, None
 
         if mode == "weapon" and not secondary and nearest > 36:
             return goal, mode, target if estimate and estimate.first_shot < 0.35 else None, None
@@ -216,12 +392,21 @@ class Bot:
             return goal, mode, resource, None
         if (target is not None and distance(pos, target["pos"]) < 155
                 and (mode not in ("weapon", "cube") or nearest < 42)):
-            preferred = 67
-            if secondary and secondary["kind"] == "lightning" and me["energy"] > 15:
-                preferred = secondary["stats"]["range"] * 0.79
-            elif secondary and secondary["kind"] == "mortar":
-                preferred = 51
-            return self.movement.engage(obs, target, preferred, False, zone_goal), "fight", target, None
+            d = distance(pos, target["pos"])
+            preferred = self.movement.preferred_range(obs, target)
+            kill_time = estimate.kill_time if estimate and math.isfinite(estimate.kill_time) else 2.5
+            target_hp = target.get("hp") or target.get("max_hp") or 1400
+            weak = target_hp <= max(90, me["max_hp"] * 0.34) or kill_time <= 1.10
+            close = d <= max(48, preferred + 24)
+            late = obs["alive"] <= 4 or zone["next_radius"] <= 70
+            incoming = danger * min(kill_time, 2.2) + burst * 0.6
+            affordable = hp - incoming > reserve and hp > me["max_hp"] * 0.26
+            if ((affordable and close) or (weak and close)
+                    or (late and affordable and d < preferred + 25)):
+                return self.movement.engage(obs, target, preferred, False, zone_goal), "fight", target, None
+            # Not worth crossing open ground for.  Keep the objective and let
+            # the aim layer take only shots that are already available.
+            return goal, mode, target if d < 150 else None, None
         return goal, mode, None, None
 
     def retreat_cover(self, obs, enemies, zone_goal):

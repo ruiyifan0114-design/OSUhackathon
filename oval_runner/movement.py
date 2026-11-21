@@ -28,18 +28,49 @@ class Movement:
         self.boost_until = 0
         self.jet_until = 0
 
+    def enemy_arc_range(self, target):
+        if "lightning" not in target.get("weapons", ()):
+            return 0.0
+        base = self.config["weapons"]["lightning"]["range"]
+        # Enemy upgrades are private. Leave space for a range upgrade after
+        # multiple cube offers instead of assuming the stock weapon.
+        cubes = target.get("cubes", 0)
+        return base * (1.35 if cubes >= 6 else 1.16 if cubes >= 3 else 1.0)
+
+    def preferred_range(self, obs, target):
+        me = obs["self"]
+        secondary = me["weapons"][1]
+        kind = secondary["kind"] if secondary else None
+        foes = target.get("weapons", ())
+        enemy_arc = self.enemy_arc_range(target)
+        if kind == "lightning":
+            own_arc = secondary["stats"]["range"]
+            if me["energy"] >= secondary["stats"]["energy"] + 14:
+                if own_arc > enemy_arc + 6 and enemy_arc:
+                    return min(own_arc - 3, enemy_arc + 5)
+                return own_arc * (0.73 if "laser" in foes else 0.84)
+        if enemy_arc:
+            return max(enemy_arc + 9, 82 if kind == "laser" else 0)
+        if kind == "laser":
+            return 92 if "mortar" in foes else 75
+        if kind == "mortar":
+            return 55 if "laser" in foes else 49
+        return 55 if "laser" in foes else 63
+
     def engage(self, obs, target, preferred, retreat, safe_point, finish=False):
         me = obs["self"]
         pos = me["pos"]
         tx, ty, _ = target["pos"]
         d = distance(pos, target["pos"])
+        vx, vy, _ = target.get("vel", (0, 0, 0))
+        lead = 0.34
         if finish:
-            vx, vy, _ = target.get("vel", (0, 0, 0))
-            lead = min(1.25, max(0, d - preferred) / max(1, me["stats"]["boost_speed"]))
-            tx += vx * lead
-            ty += vy * lead
+            lead = min(1.25, max(lead, (d - preferred) / max(1, me["stats"]["boost_speed"])))
+        tx += vx * lead
+        ty += vy * lead
         x, y = unit(tx - pos[0], ty - pos[1])
-        radial = max(-1, min(1, (d - preferred) / 23))
+        predicted_range = math.hypot(tx - pos[0], ty - pos[1])
+        radial = max(-1, min(1, (predicted_range - preferred) / 19))
         tangent = self.side * (0.89 if abs(radial) < 0.7 else 0.56)
         if finish and d > preferred + 6:
             radial, tangent = 1.0, self.side * 0.12
@@ -136,7 +167,11 @@ class Movement:
             reach = me["stats"]["radius"] + (mortar["splash_radius"] if shell else 0.8)
             if miss > reach + until * 20 or not z - reach - 3 < impact[2] < z + me["stats"]["height"] + reach + 3:
                 continue
-            danger.append((miss + until * 2, until, impact, reach, 6.0 if shell else 2.7))
+            # Keep threatening splash shells in the small candidate set even
+            # when several bullets have a smaller absolute miss distance.
+            priority = miss / reach + 0.75 * until + (0.0 if shell else 0.55)
+            danger.append((priority, until, impact, reach,
+                           6.8 if shell else 2.7, (sx, sy)))
         return sorted(danger)[:8]
 
     @staticmethod
@@ -148,7 +183,7 @@ class Movement:
             return math.inf
         return abs(ox * sin - oy * cos)
 
-    def apply(self, action, obs, goal, mode, enemies, ring=None):
+    def apply(self, action, obs, goal, mode, enemies, ring=None, target=None, alert=None):
         me = obs["self"]
         now = obs["t"]
         pos = me["pos"]
@@ -156,6 +191,11 @@ class Movement:
         stats = me["stats"]
         zone = obs["zone"]
         threats = enemies[:2]
+        attack = target if mode in ("fight", "finish") else None
+        secondary = me["weapons"][1]
+        lightning = secondary if secondary and secondary["kind"] == "lightning" else None
+        own_arc = lightning["stats"]["range"] if lightning else 0.0
+        arc_active = bool(lightning and me["energy"] > lightning["stats"]["energy"] + 12)
         hazards = self.hazards(obs)
         radius, height, step = (stats[key] for key in ("radius", "height", "step_up"))
         torso = (pos[0], pos[1], pos[2] + height * 0.58)
@@ -192,6 +232,19 @@ class Movement:
         if not traveling:
             if beams:
                 dx, dy = -beams[0][2] * self.side, beams[0][1] * self.side
+            elif hazards:
+                # Move across the projectile's flight path rather than choosing
+                # an arbitrary direction.  If the predicted impact is offset,
+                # blend in the radial escape direction as well.
+                _, _, hit, _, _, shot_vel = hazards[0]
+                sx, sy = shot_vel
+                px, py = -sy, sx
+                if px == py == 0:
+                    px, py = -vy, vx
+                rx, ry = unit(pos[0] - hit[0], pos[1] - hit[1])
+                if px * rx + py * ry < 0:
+                    px, py = -px, -py
+                dx, dy = unit(px + 0.6 * rx, py + 0.6 * ry)
             else:
                 dx, dy = unit(-vy, vx)
             if dx == dy == 0:
@@ -199,18 +252,22 @@ class Movement:
 
         energy = me["energy"]
         near = distance(pos, threats[0]["pos"]) if threats else math.inf
-        lightning = next((w for w in me["weapons"] if w and w["kind"] == "lightning"), None)
-        closing = lightning and mode == "fight" and lightning["stats"]["range"] + 4 < near < 95
+        engagement_distance = distance(pos, attack["pos"]) if attack else near
+        arc_opening = self.enemy_arc_range(attack) if attack else 0
+        closing = arc_active and mode == "fight" and own_arc + 3 < engagement_distance < 85
+        closing_energy = 68 if arc_opening else 52
         reserve = 32 if lightning else 22
-        chasing = mode == "finish" and near > (lightning["stats"]["range"] * 0.77 if lightning else 28)
-        if (traveling and mode in ("zone", "retreat") and energy > 32 or
-                traveling and closing and energy > 77 or
+        chasing = mode == "finish" and engagement_distance > (own_arc * 0.77 if arc_active else 28)
+        if (traveling and mode in ("zone", "retreat", "caution") and energy > 32 or
+                traveling and closing and energy > closing_energy or
                 traveling and chasing and energy > reserve + 9 or
                 traveling and mode in ("weapon", "drop") and near < 110 and goal_distance > 17 and energy > 77):
             self.boost_until = max(self.boost_until, now + 0.18)
         ground_boost = me["grounded"] and now < self.boost_until and energy > 15
         speed = stats["boost_speed"] if ground_boost else stats["walk_speed"]
-        if any(w and w.get("charge", 0) > 0 for w in me["weapons"]):
+        fire = action.get("fire", (False, False))
+        if any(w and w["kind"] == "laser" and (w.get("charge", 0) > 0 or trigger)
+               for w, trigger in zip(me["weapons"], fire)):
             speed *= stats.get("charge_move_mult", self.config["mech"].get("charge_move_mult", 0.5))
         reach = min(14, max(3, speed * 0.76), max(3, goal_distance))
         max_score, best = -math.inf, (dx, dy, 0)
@@ -218,22 +275,44 @@ class Movement:
 
         # Outside combat the clear direct route is usually optimal.
         direct_clear = self.arena.walk_fraction(pos, dx * reach, dy * reach, radius, height, step)
-        if direct_clear == 1 and traveling and not hazards and not threats and not beams and ring is None and now >= self.recover_until:
+        alert_near = bool(alert is not None and alert.age(now) < 1.8 and alert.distance < 120)
+        if (direct_clear == 1 and traveling and not hazards and not threats and not beams
+                and ring is None and not alert_near and now >= self.recover_until):
             best = dx, dy, direct_clear
         else:
             last_x, last_y = self.last_heading
-            origins = [(p[0], p[1], p[2] + 8) for p in (foe["pos"] for foe in threats)]
-            origins = [(origin, distance(pos, origin)) for origin in origins]
+            origins = []
+            for foe in threats:
+                px, py, pz = foe["pos"]
+                origin = (px, py, pz + 8)
+                hostile_arc = self.enemy_arc_range(foe)
+                shared_duel = attack is not None and foe["id"] == attack["id"]
+                if hostile_arc and shared_duel and arc_active and own_arc <= hostile_arc + 5:
+                    # Closing is worthwhile when both mechs have similar arc
+                    # range. The aim layer can still fire while we strafe.
+                    hostile_arc = min(hostile_arc, 22)
+                origins.append((origin, distance(pos, origin), hostile_arc))
+            if attack:
+                ax, ay, az = attack["pos"]
+                avx, avy, avz = attack.get("vel", (0, 0, 0))
+                aim_point = (ax + 0.35 * avx, ay + 0.35 * avy, az + 4.8 + 0.16 * avz)
+                gun = me["weapons"][0]
+                ready_gun = gun and gun["kind"] == "gun" and gun.get("reload", 0) < 0.45
+                straight_shot = ready_gun or arc_active or secondary and secondary["kind"] == "laser"
+                attack_reach = max(128 if ready_gun else 0, own_arc if arc_active else 0,
+                                   175 if secondary and secondary["kind"] == "laser" else 0)
+                yaw = attack["aim"][0]
+                attack_facing = math.cos(yaw), math.sin(yaw)
             accel = stats["ground_accel"] if me["grounded"] else stats["air_accel"]
             turn = 0.5 * accel / max(1, speed)
             # Acceleration is common to all headings. Keep only the steering-dependent term
             # inside the candidate loop.
             predictions = []
-            for _, t, hit, safe, severity in hazards:
+            for _, t, hit, safe, severity, _ in hazards:
                 gain = min(1.0, t * turn)
                 predictions.append((hit[0] - pos[0] - t * vx * (1 - gain),
                                     hit[1] - pos[1] - t * vy * (1 - gain),
-                                    t * speed * gain, safe, severity))
+                                    t, safe, severity))
             beam_gain = min(1.0, 0.36 * turn)
             for along, across in ANGLES:
                 ux, uy = dx * along - dy * across, dy * along + dx * across
@@ -244,6 +323,9 @@ class Movement:
                 endpoint = (pos[0] + ux * travel, pos[1] + uy * travel, pos[2] + height * 0.58)
                 score = ((2.35 if traveling else 0.15) * along * fraction + 3.55 * fraction
                          + 0.64 * (ux * last_x + uy * last_y) + 0.08 * across * self.side)
+                if alert_near:
+                    toward = ux * math.cos(alert.bearing) + uy * math.sin(alert.bearing)
+                    score -= (1.05 if alert.distance < 45 else 0.55) * max(0.0, toward)
                 if room < 38:
                     future_room = zone["radius"] - distance(endpoint, zone["center"])
                     score -= max(0, 14 - future_room) * (0.36 if room >= 0 else 0.52)
@@ -251,7 +333,7 @@ class Movement:
                     center, ring_radius = ring
                     score -= 2.3 * max(0, distance(endpoint, center) - max(0, ring_radius - 1))
 
-                for origin, before in origins:
+                for origin, before, hostile_arc in origins:
                     after = distance(endpoint, origin)
                     if mode == "retreat" and travel > 2 and after < 135:
                         if not self.arena.clear(origin, endpoint):
@@ -259,6 +341,18 @@ class Movement:
                         score += 0.11 * (after - before)
                     else:
                         score -= 0.19 * max(0, 20 - after)
+                    if attack or mode == "retreat":
+                        score -= 0.17 * max(0, hostile_arc + 3 - after) if hostile_arc else 0
+                if attack:
+                    attack_distance = distance(endpoint, aim_point)
+                    if arc_active and engagement_distance < own_arc + 12:
+                        score -= 0.25 * max(0, attack_distance - own_arc + 2)
+                    if straight_shot and attack_distance < attack_reach and travel > 2:
+                        muzzle = (endpoint[0], endpoint[1], endpoint[2] + stats["muzzle_height"] - height * 0.58)
+                        if self.arena.clear(muzzle, aim_point):
+                            side = ((muzzle[0] - aim_point[0]) * attack_facing[0] +
+                                    (muzzle[1] - aim_point[1]) * attack_facing[1])
+                            score += (2.2 if mode == "finish" else 1.65) + 0.5 * (side < -7)
                 if beams:
                     # A charged shot can fire before reaching the route endpoint.
                     # Reward lateral acceleration at short and steering horizons.
@@ -268,9 +362,13 @@ class Movement:
                         score -= 1.35 * max(0, radius + 2 - self.beam_margin(near_point, beam, height))
                         score -= 0.35 * max(0, radius + 5 - self.beam_margin(endpoint, beam, height))
 
-                for x, y, gain, safe, severity in predictions:
-                    advance = gain * fraction
-                    margin = math.hypot(x - ux * advance, y - uy * advance) - safe
+                for x, y, t, safe, severity in predictions:
+                    # The candidate can displace at most speed * t (and only
+                    # as far as the clear fraction allows).  This used to be a
+                    # dimensionless gain*fraction, which capped the dodge at
+                    # one metre regardless of speed or warning time.
+                    available = min(t, reach / max(1.0, speed)) * speed * fraction
+                    margin = math.hypot(x - ux * available, y - uy * available) - safe
                     score -= severity * max(0, 1 - margin / max(1, safe))
                 if score > max_score:
                     max_score, best = score, (ux, uy, fraction)

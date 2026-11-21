@@ -195,10 +195,40 @@ class Combat:
             max(0.0, abs(shot.pitch - pitch) - shot.vertical_tolerance) / stats["pitch_rate"],
         )
 
+    def _turn_between(self, me, previous, shot):
+        stats = me["stats"]
+        return max(
+            max(0.0, abs(angle_error(shot.yaw, previous.yaw)) - shot.horizontal_tolerance) / stats["turn_rate"],
+            max(0.0, abs(shot.pitch - previous.pitch) - shot.vertical_tolerance) / stats["pitch_rate"],
+        )
+
+    def _shared_aim(self, first, second):
+        """Find a command in the intersection of both useful aim windows."""
+        second_yaw = first.yaw + angle_error(second.yaw, first.yaw)
+        low = max(first.yaw - first.horizontal_tolerance, second_yaw - second.horizontal_tolerance)
+        high = min(first.yaw + first.horizontal_tolerance, second_yaw + second.horizontal_tolerance)
+        bottom = max(first.pitch - first.vertical_tolerance, second.pitch - second.vertical_tolerance)
+        top = min(first.pitch + first.vertical_tolerance, second.pitch + second.vertical_tolerance)
+        if low >= high or bottom >= top:
+            return None
+        return Shot(math.remainder(0.5 * (low + high), math.tau), 0.5 * (bottom + top),
+                    first.distance, 0.0, 0.0)
+
+    def _rear_bonus(self, target, yaw, flight):
+        """Discount rear armor near the edge or when the target has time to turn."""
+        if target.get("kind") != "mech" or "aim" not in target:
+            return 1.0
+        stats = self.config["mech"]
+        rear_margin = abs(angle_error(yaw + math.pi, target["aim"][0])) - math.radians(stats["front_arc_deg"]) / 2
+        confidence = min(1.0, max(0.0, (rear_margin - 0.10) / (0.35 + flight * 2)))
+        return 1 + (stats["rear_mult"] - 1) * confidence
+
     def _shot_damage(self, me, target, weapon, shot, charge_fraction=1.0):
+        """Return expected damage and damage conditional on a direct hit."""
         stats = weapon["stats"]
         kind = weapon["kind"]
         damage = stats["damage"]
+        accuracy = 1.0
         cubes = self.config["cubes"]
         damage *= 1 + cubes["damage_per_cube"] * min(me["cubes"], cubes["stat_cap"])
         if kind == "laser":
@@ -209,14 +239,17 @@ class Combat:
         elif kind == "gun":
             # Forecast the part of the spread cone inside the target width.
             spread = max(0.001, math.radians(stats["spread_deg"]))
-            damage *= math.erf(shot.horizontal_tolerance / (math.sqrt(2) * spread))
+            accuracy = math.erf(shot.horizontal_tolerance / (math.sqrt(2) * spread))
         elif kind == "mortar":
             damage += stats["splash"] * 0.70
         if target.get("kind") == "mech":
             # A longer flight gives the opponent time to invalidate its current lead.
             vx, vy, _ = target.get("vel", (0, 0, 0))
-            damage *= 0.94 / (1 + 0.55 * shot.flight * (1 + 0.2 * math.hypot(vx, vy)))
-        return damage
+            accuracy /= 1 + 0.55 * shot.flight * (1 + 0.2 * math.hypot(vx, vy))
+            rear = self._rear_bonus(target, shot.yaw, shot.flight)
+            # The mortar's blast approaches from its impact point.
+            damage *= 0.94 * (rear if kind != "mortar" else 1 + 0.5 * (rear - 1))
+        return damage * accuracy, damage
 
     def _ready_delay(self, me, weapon):
         """Earliest trigger without changing the aim, excluding laser charge."""
@@ -240,7 +273,7 @@ class Combat:
         infinity. This is a tactical comparison, not a movement prediction.
         """
         me = obs["self"]
-        events = []
+        schedules = []
         horizon = 8.0
         for weapon in me["weapons"]:
             if weapon is None:
@@ -253,7 +286,7 @@ class Combat:
             if shot is None:
                 continue
             turn = self._turn_time(me, shot)
-            damage = self._shot_damage(me, target, weapon, shot)
+            damage, _ = self._shot_damage(me, target, weapon, shot)
             interval = max(self.step, stats["cooldown"])
             ammo = weapon.get("ammo", 0)
             limit = 40
@@ -264,29 +297,39 @@ class Combat:
                 goal = self._charge_goal(me, target, weapon)
                 charge = weapon.get("charge", 0)
                 delay += max(0.0, goal - charge)
-                opening_damage = self._shot_damage(me, target, weapon, shot, min(1, max(goal, charge) / stats["charge"]))
+                opening_damage, _ = self._shot_damage(
+                    me, target, weapon, shot, min(1, max(goal, charge) / stats["charge"])
+                )
                 interval += stats["charge"]
             elif kind == "gun" and (ammo <= 0 or weapon.get("reload", 0) > 0):
                 ammo = int(stats["mag"])
             elif kind == "lightning":
                 reserve = 5 if me["grounded"] else 14
                 limit = min(limit, max(0, int((me["energy"] - reserve) / max(0.01, stats["energy"]))))
-            impact = max(self.step, turn, delay) + shot.flight
+            trigger = max(self.step, turn, delay)
+            events = []
             for index in range(limit):
-                if impact > horizon:
+                if trigger + shot.flight > horizon:
                     break
-                events.append((impact, opening_damage if index == 0 else damage))
+                events.append((trigger, opening_damage if index == 0 else damage))
                 if kind == "gun":
                     ammo -= 1
                     if ammo <= 0:
-                        impact += stats["reload"]
+                        trigger += stats["reload"]
                         ammo = int(stats["mag"])
                         continue
-                impact += interval
-        if not events:
+                trigger += interval
+            if events:
+                schedules.append((shot, events))
+        if not schedules:
             return Engagement()
+        if len(schedules) == 1:
+            shot, triggers = schedules[0]
+            events = [(trigger + shot.flight, value) for trigger, value in triggers]
+        else:
+            events = self._combine_schedules(me, schedules, horizon)
         events.sort()
-        hp = target.get("hp", target.get("max_hp", 1400))
+        hp = target.get("hp") or target.get("max_hp") or 1400
         dealt = 0.0
         kill_time = math.inf
         damage_1s = 0.0
@@ -297,6 +340,39 @@ class Combat:
             if dealt >= hp and kill_time == math.inf:
                 kill_time = impact
         return Engagement(events[0][0], kill_time, damage_1s)
+
+    def _combine_schedules(self, me, schedules, horizon):
+        (first, left), (second, right) = schedules
+        if self._shared_aim(first, second) is not None:
+            return [(trigger + first.flight, damage) for trigger, damage in left] + [
+                (trigger + second.flight, damage) for trigger, damage in right
+            ]
+        # One torso cannot schedule two independent aim angles. Delay each
+        # trigger by the required slew and preserve that slot's next cooldown.
+        shots = (first, second)
+        triggers = (left, right)
+        shifts = [0.0, 0.0]
+        indices = [0, 0]
+        slew = (self._turn_between(me, second, first), self._turn_between(me, first, second))
+        active = -1
+        previous = 0.0
+        impacts = []
+        while True:
+            options = []
+            for slot, queue in enumerate(triggers):
+                if indices[slot] == len(queue):
+                    continue
+                booked, value = queue[indices[slot]]
+                when = max(booked + shifts[slot], previous + slew[slot] if active == 1 - slot else previous)
+                if when + shots[slot].flight <= horizon:
+                    options.append((when, when + shots[slot].flight, -value, slot))
+            if not options:
+                return impacts
+            when, impact, negative, slot = min(options)
+            shifts[slot] = when - triggers[slot][indices[slot]][0]
+            indices[slot] += 1
+            active, previous = slot, when
+            impacts.append((impact, -negative))
 
     def apply(self, action, obs, target, scan_yaw, allow_new_charge=True):
         me = obs["self"]
@@ -347,8 +423,7 @@ class Combat:
             if shot is not None:
                 shots[slot] = shot
 
-        delays = {}
-        damage = {}
+        ready_weapons = {}
         preparation = {}
         for slot, shot in shots.items():
             weapon = weapons[slot]
@@ -362,8 +437,8 @@ class Combat:
                 if not charge or charge < charge_goal - 1e-3:
                     delay = max(delay, self.frame + self.step)
             if delay <= self.frame + 1e-4 and not (kind == "gun" and weapon.get("ammo", 0) <= 0):
-                delays[slot] = delay
-                damage[slot] = self._shot_damage(me, target, weapon, shot, fraction)
+                expected, connected = self._shot_damage(me, target, weapon, shot, fraction)
+                ready_weapons[slot] = (delay, max(self.step, delay) + shot.flight, expected, connected)
             # Prefer aim that can use a soon-to-ready secondary when no shot
             # can land this frame. Do not let pre-aim block a payable shot.
             preparation[slot] = max(self._turn_time(me, shot), delay) + shot.flight * 0.22
@@ -372,10 +447,15 @@ class Combat:
         fire_now = ()
         best = None
         hp = target.get("hp", math.inf)
-        for slot, shot in shots.items():
-            ready = tuple(i for i, delay in delays.items() if self._heading_hits(me, shot, shots[i], delay))
-            expected = sum(damage[i] for i in ready)
-            score = (expected >= hp, expected, -preparation[slot])
+        candidates = [(shot, preparation[slot]) for slot, shot in shots.items()]
+        if len(ready_weapons) == 2:
+            shared = self._shared_aim(shots[0], shots[1])
+            if shared is not None:
+                candidates.append((shared, max(preparation.values())))
+        for shot, prepare in candidates:
+            ready = tuple(slot for slot, data in ready_weapons.items()
+                          if self._heading_hits(me, shot, shots[slot], data[0]))
+            score = self._burst_score(ready, ready_weapons, hp, prepare)
             if best is None or score > best:
                 best, aim, fire_now = score, shot, ready
         action["aim"] = [aim.yaw, aim.pitch]
@@ -397,6 +477,23 @@ class Combat:
                 action["fire"][laser] = abs(angle_error(shot.yaw, me["aim"][0])) < 0.32
         return action
 
+    @staticmethod
+    def _burst_score(ready, data, hp, prepare):
+        impact_order = sorted(ready, key=lambda slot: data[slot][1])
+        expected = connected = value = 0.0
+        kill = math.inf
+        for slot in impact_order:
+            _, impact, mean, hit = data[slot]
+            expected += mean
+            connected += hit
+            value += mean / (1 + 0.8 * impact)
+            # A quick shot with good hit probability can finish before a
+            # stronger, slower round reaches the same target.
+            if kill == math.inf and (expected >= hp or
+                                     impact < 0.45 and connected >= hp and expected >= hp * 0.76):
+                kill = impact
+        return math.isfinite(kill), -kill, value, -prepare
+
     def _charge_goal(self, me, target, weapon):
         stats = weapon["stats"]
         full = stats["charge"]
@@ -409,6 +506,7 @@ class Combat:
             damage *= 1 + stats["cookoff"]
         if target.get("kind") == "mech":
             # Enemy armor is private. Do not release early on a marginal estimate.
-            damage *= 0.92
+            yaw = math.atan2(target["pos"][1] - me["pos"][1], target["pos"][0] - me["pos"][0])
+            damage *= 0.92 * self._rear_bonus(target, yaw, full - weapon.get("charge", 0))
         needed = (hp / damage - stats["min_frac"]) / (1 - stats["min_frac"])
         return min(full, max(stats["min_charge"], needed * full + self.step))
