@@ -1,0 +1,5 @@
+**
+!Dockerfile
+!oval_runner/
+!oval_runner/bot.py
+!oval_runner/mechfight.py
