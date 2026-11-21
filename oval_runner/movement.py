@@ -258,7 +258,7 @@ class Movement:
         closing_energy = 68 if arc_opening else 52
         reserve = 32 if lightning else 22
         chasing = mode == "finish" and engagement_distance > (own_arc * 0.77 if arc_active else 28)
-        if (traveling and mode in ("zone", "retreat", "caution") and energy > 32 or
+        if (traveling and mode in ("zone", "retreat", "caution", "laser_break") and energy > 32 or
                 traveling and closing and energy > closing_energy or
                 traveling and chasing and energy > reserve + 9 or
                 traveling and mode in ("weapon", "drop") and near < 110 and goal_distance > 17 and energy > 77):
@@ -335,13 +335,13 @@ class Movement:
 
                 for origin, before, hostile_arc in origins:
                     after = distance(endpoint, origin)
-                    if mode == "retreat" and travel > 2 and after < 135:
+                    if mode in ("retreat", "laser_break") and travel > 2 and after < 135:
                         if not self.arena.clear(origin, endpoint):
                             score += 2.5
                         score += 0.11 * (after - before)
                     else:
                         score -= 0.19 * max(0, 20 - after)
-                    if attack or mode == "retreat":
+                    if attack or mode in ("retreat", "laser_break"):
                         score -= 0.17 * max(0, hostile_arc + 3 - after) if hostile_arc else 0
                 if attack:
                     attack_distance = distance(endpoint, aim_point)
