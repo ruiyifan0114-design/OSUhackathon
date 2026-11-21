@@ -568,7 +568,7 @@ class Bot:
                 value = ratings[item["kind"]]
                 if item["kind"] != "gun" and value > current_weapon + (0.8 if current_weapon else 0):
                     add(key, item["pos"], "weapon", 127 if not current_weapon else 42,
-                        radius=85 if not current_weapon else 90)
+                        radius=127 if not current_weapon else 90)
             elif can_farm and now - seen < 5:
                 add(key, item["pos"], "farm", 41 + 0.061 * (300 - item.get("hp", 300)), item, radius=87)
 
