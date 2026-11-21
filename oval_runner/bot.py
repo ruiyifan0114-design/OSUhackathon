@@ -86,6 +86,8 @@ class Bot:
         self.damage_done = self.damage_taken = self.kills = 0
         self.laser_cooldown = {}
         self.last_attacker = None
+        self.kill_reset_until = 0.0
+        self.last_target_pos = None
 
     def update(self, obs):
         now = obs["t"]
@@ -105,6 +107,7 @@ class Bot:
                 self.damage_done += event["amount"]
             elif kind == "kill":
                 self.kills += 1
+                self.kill_reset_until = now + 1.2
                 if self.first_kill is None:
                     self.first_kill = now
             elif kind == "took" and event["kind"] != "gun" and self.first_weapon is None:
@@ -167,6 +170,8 @@ class Bot:
             obs, enemies, nearby, threats, danger, zone_goal, urgent,
             ratings, rating, alert,
         )
+        if target is not None:
+            self.last_target_pos = list(target["pos"])
         if mode in ("fight", "finish", "breakout"):
             self.combat_target = target["id"]
         else:
@@ -325,6 +330,19 @@ class Bot:
         _, target, estimate = max(ranked, key=lambda item: item[0], default=(0, None, None))
         if urgent:
             return zone_goal, "zone", target, None
+
+        # E2: after a kill, leave the lane before looking for the next fight.
+        if now < self.kill_reset_until:
+            foes = [foe for _, _, foe in threats][:2]
+            cover = self.retreat_cover(obs, foes, zone_goal) if foes else None
+            if cover is None and self.last_target_pos is not None:
+                bearing = math.atan2(pos[1] - self.last_target_pos[1],
+                                       pos[0] - self.last_target_pos[0])
+                cover = (pos[0] - 20 * math.cos(bearing),
+                         pos[1] - 20 * math.sin(bearing), pos[2])
+            elif cover is None and distance(pos, zone_goal) > 12:
+                cover = zone_goal
+            return cover, "reset", None, None
 
         reserve = me["max_hp"] * (0.09 if obs["alive"] <= 3 else 0.16)
         burst = sum(amount for _, amount, _ in threats)
