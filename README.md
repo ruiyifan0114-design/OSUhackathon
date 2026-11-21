@@ -14,6 +14,7 @@ The bot uses only the Python standard library and runs as an unprivileged user o
 - **Predictive weapons**: leads gun targets, arcs mortar shells, charges/releases lasers, and schedules both weapon slots around one torso.
 - **Sound awareness**: keeps a short recency-weighted memory of gunfire, jets, footsteps, laser charges, and other sounds; turns to scan unseen threats, backs away from close contacts, and can use a nearby sound as a coarse lightning target.
 - **Mobility build**: values `servos`, `jets`, `capacitor`, and `reactor`; boosts normal travel, closing fights, and projectile dodges while preserving energy for lightning and braking earlier at pickups.
+- **Squad-aware fighting**: prefers wounded/isolated house bots, avoids clustered targets, and raises mortar/lightning value when several bots are close enough to share splash or chain damage.
 - **Survival first**: disengages to cover at low HP or against multiple threats, avoids long open-ground chases, values wounded/isolated targets, and uses zone timing and supply drops.
 - **Config-driven upgrades**: values an offer from its `hello.config.upgrades` effect paths instead of a hard-coded id list, including `lightning_chain`, `laser_pierce`, and `mortar_velocity`.
 - **Projectile evasion**: uses warning time and speed in metres (not a dimensionless gain) to choose lateral movement away from bullets and mortar splash.

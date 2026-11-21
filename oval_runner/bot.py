@@ -293,6 +293,7 @@ class Bot:
 
         # Spend the short-horizon combat estimate on nearby, plausible opponents.
         ranked = []
+        isolation_by_id = {}
         for foe in enemies[:4]:
             d = distance(pos, foe["pos"])
             if d > 190 or urgent and d > 55:
@@ -305,9 +306,21 @@ class Bot:
             foe_max = foe.get("max_hp") or 1400
             wounded = 1 - min(1.0, foe_hp / max(1.0, foe_max))
             revenge = 8 if foe["id"] == self.last_attacker and now - self.last_damage < 3 else 0
+            isolation = min(
+                (distance(foe["pos"], other["pos"]) for other in enemies
+                 if other["id"] != foe["id"]),
+                default=200.0,
+            )
+            isolation_by_id[foe["id"]] = isolation
+            # The practice squad shares vision and does not fight itself.
+            # A target separated from its squad is the only kind of fight
+            # that can be converted into a clean kill.
+            room_bonus = 9.0 * min(1.0, isolation / 55.0)
+            crowd_penalty = 7.0 if isolation < 22 else 0.0
             score = (0.58 * estimate.damage_1s + 165 / (0.75 + estimate.kill_time)
                      - 0.29 * d - 19 * min(2, estimate.first_shot)
-                     + 34 * wounded + revenge + stick)
+                     + 34 * wounded + revenge + stick
+                     + room_bonus - crowd_penalty)
             ranked.append((score, foe, estimate))
         _, target, estimate = max(ranked, key=lambda item: item[0], default=(0, None, None))
         if urgent:
@@ -330,7 +343,10 @@ class Bot:
         finish = None
         best_finish = -math.inf
         for score, foe, eta in ranked:
-            if eta.kill_time > 2.3 or not zone_safe(foe):
+            foe_hp = foe.get("hp") or foe.get("max_hp") or 1400
+            finish_window = (2.8 if foe_hp <= me["max_hp"] * 0.55
+                             or isolation_by_id.get(foe["id"], 0) > 45 else 2.3)
+            if eta.kill_time > finish_window or not zone_safe(foe):
                 continue
             # Count incoming fire until the kill, then only fire from survivors.
             remaining_rate = max(0, danger - rate_by_id.get(foe["id"], 0))
@@ -466,6 +482,17 @@ class Bot:
         small = obs["zone"]["next_radius"] <= 70
         has_mortar_enemy = any("mortar" in e.get("weapons", ()) for e in enemies[:3])
         ratings = {"gun": 0, "mortar": 5.1, "laser": 4.4, "lightning": 6.0}
+        # A squad that shares vision often converges in pairs.  Splash and
+        # chain damage gain value exactly when two or more targets are close.
+        visible = enemies[:6]
+        clustered = sum(
+            1 for index, foe in enumerate(visible)
+            if any(index != other_index and distance(foe["pos"], other["pos"]) <= 8
+                   for other_index, other in enumerate(visible))
+        )
+        if clustered >= 2:
+            ratings["mortar"] += min(1.8, 0.6 * clustered)
+            ratings["lightning"] += 0.2 * clustered
         if small:
             ratings["lightning"] += 2
         elif has_mortar_enemy:
