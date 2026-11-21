@@ -183,15 +183,14 @@ class Bot:
         else:
             scan = me["aim"][0] + 0.31
         escaping = mode in ("zone", "retreat", "breakout")
-        steering_mode = "retreat" if mode == "breakout" else mode
-        self.movement.apply(action, obs, goal, steering_mode, nearby,
-                            ring=ring, target=target, alert=alert)
-        steady = not escaping and not action.get("jump") and not action.get("boost")
-        self.combat.apply(action, obs, target, scan, allow_new_charge=steady)
+        self.combat.apply(action, obs, target, scan, allow_new_charge=not escaping)
         if target is None and not escaping and alert is not None:
             self.blind_lightning(action, obs, alert)
         if secondary and secondary["kind"] == "laser" and escaping:
             action["fire"][1] = False
+        steering_mode = "retreat" if mode == "breakout" else mode
+        self.movement.apply(action, obs, goal, steering_mode, nearby,
+                            ring=ring, target=target, alert=alert)
         self.trace(obs, mode, target)
         return action
 
@@ -329,7 +328,6 @@ class Bot:
 
         reserve = me["max_hp"] * (0.09 if obs["alive"] <= 3 else 0.16)
         burst = sum(amount for _, amount, _ in threats)
-        crossfire = exposed >= 2 and danger + burst * 0.5 > 135
         rate_by_id = {foe["id"]: rate for rate, _, foe in threats}
 
         def zone_safe(foe):
@@ -353,8 +351,6 @@ class Bot:
             # Count incoming fire until the kill, then only fire from survivors.
             remaining_rate = max(0, danger - rate_by_id.get(foe["id"], 0))
             loss = danger * eta.kill_time + remaining_rate * 0.55 + burst
-            if crossfire and (eta.kill_time > 0.85 or loss > hp * 0.38):
-                continue
             utility = score - 0.43 * loss - 30 * eta.kill_time
             if hp - loss > reserve and utility > best_finish:
                 best_finish, finish = utility, (foe, eta)
@@ -385,7 +381,7 @@ class Bot:
         reloading = (exposed > 0 and nearest < 70 and estimate is not None
                      and estimate.first_shot > 0.65 and hp < danger * 3 + burst
                      and obs["self"]["weapons"][0].get("reload", 0) > 0.45)
-        if self.recovering or outmatched or reloading or crossfire:
+        if self.recovering or outmatched or reloading:
             immediate = [foe for _, _, foe in threats] or nearby
             if not immediate and nearest < 170 and obs["t"] - self.last_damage < 3:
                 immediate = enemies[:1]
@@ -416,7 +412,7 @@ class Bot:
             visible = [foe for _, _, foe in threats]
             if visible:
                 candidate = min(visible, key=lambda foe: distance(pos, foe["pos"]))
-                if distance(pos, candidate["pos"]) < (55 if crossfire else 140):
+                if distance(pos, candidate["pos"]) < 140:
                     defensive = candidate
             return cover, "retreat", defensive, None
 

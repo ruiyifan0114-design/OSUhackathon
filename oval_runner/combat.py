@@ -3,8 +3,6 @@
 from dataclasses import dataclass
 import math
 
-from kinematics import feet_after
-
 
 def angle_error(first, second):
     return math.remainder(first - second, math.tau)
@@ -94,7 +92,7 @@ class Combat:
             previous = point
         return True
 
-    def _solution(self, me, target, weapon, latency, aim_at, feet=None):
+    def _solution(self, me, target, weapon, latency, aim_at):
         stats = weapon["stats"]
         kind = weapon["kind"]
         own = me["stats"]
@@ -102,8 +100,8 @@ class Combat:
         p = me["pos"]
         own_v = me["vel"]
         muzzle = own["height"] + 0.5 if kind == "mortar" else own["muzzle_height"]
-        feet = feet if feet is not None else tuple(p[i] + own_v[i] * latency for i in range(3))
-        origin = feet[0], feet[1], feet[2] + muzzle
+        origin = (p[0] + own_v[0] * latency, p[1] + own_v[1] * latency,
+                  p[2] + own_v[2] * latency + muzzle)
         target_pos = target["pos"]
         velocity = target.get("vel", (0, 0, 0))
         dx = target_pos[0] + velocity[0] * latency - origin[0]
@@ -153,10 +151,10 @@ class Combat:
             vertical = math.pi
         return Shot(math.atan2(ey, ex), pitch, distance, horizontal, vertical, flight)
 
-    def _shot(self, me, target, weapon, latency, feet=None):
-        shot = self._solution(me, target, weapon, latency, 0.52, feet)
+    def _shot(self, me, target, weapon, latency):
+        shot = self._solution(me, target, weapon, latency, 0.52)
         if shot is None and weapon["kind"] in ("gun", "laser"):
-            shot = self._solution(me, target, weapon, latency, 0.83, feet)
+            shot = self._solution(me, target, weapon, latency, 0.83)
         return shot
 
     def _frame_shot(self, obs, target, weapon):
@@ -170,15 +168,6 @@ class Combat:
             latency = self.step * 0.55 + min(self.step, max(0, cooldown - self.step))
             self.solutions[key] = self._shot(obs["self"], target, weapon, latency)
         return self.solutions[key]
-
-    def _moving_shot(self, me, target, weapon, action, charging=False):
-        # A ready weapon can fire on the next sim step, while a cooling
-        # weapon may fire during the second step of this decision.
-        delay = max(weapon.get("cooldown", 0), weapon.get("reload", 0))
-        step = math.ceil(max(delay - 1e-6, 0) / self.step)
-        latency = min(self.steps, max(1, step)) * self.step
-        feet = feet_after(me, action, latency, self.arena, charging=charging)
-        return self._shot(me, target, weapon, latency, feet)
 
     def _heading_hits(self, me, aimed, shot, delay=0):
         """Check the aim after the first simulation step on which a shot can fire."""
@@ -432,10 +421,7 @@ class Combat:
                 charge_goal = self._charge_goal(me, target, weapon)
                 if not weapon.get("charge", 0) and "lightning" in target.get("weapons", ()) and distance < 48:
                     continue
-            if "move" in action:
-                shot = self._moving_shot(me, target, weapon, action)
-            else:
-                shot = self._frame_shot(obs, target, weapon)
+            shot = self._frame_shot(obs, target, weapon)
             if shot is not None:
                 shots[slot] = shot
 
@@ -491,15 +477,6 @@ class Combat:
             elif shot is not None:
                 self.laser_wait = 0
                 action["fire"][laser] = abs(angle_error(shot.yaw, me["aim"][0])) < 0.32
-                if action["fire"][laser] and gun and "move" in action:
-                    gun_slot = 1 - laser
-                    if action["fire"][gun_slot]:
-                        compensated = self._moving_shot(me, target, gun, action, charging=True)
-                        action["fire"][gun_slot] = compensated is not None and self._heading_hits(
-                            me, compensated, compensated, self._ready_delay(me, gun)
-                        )
-                        if action["fire"][gun_slot]:
-                            action["aim"] = [compensated.yaw, compensated.pitch]
         return action
 
     @staticmethod
