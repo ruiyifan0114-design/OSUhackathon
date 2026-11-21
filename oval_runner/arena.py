@@ -222,10 +222,11 @@ class Arena:
         ax, ay, az = a
         bx, by, bz = b
         dx, dy, dz = bx - ax, by - ay, bz - az
+        zmin, zmax = min(az, bz), max(az, bz)
         for prism in self._ray_prisms(ax, ay, bx, by):
-            if prism.blocks_ray(ax, ay, az, dx, dy, dz):
+            if prism.base <= zmax and prism.top >= zmin and prism.blocks_ray(ax, ay, az, dx, dy, dz):
                 return False
-        if self.terrain is None or min(az, bz) >= self.highest_ground:
+        if self.terrain is None or zmin >= self.highest_ground:
             return True
         # Sample in horizontal distance because the height field is 2-D.
         steps = max(1, math.ceil(math.hypot(dx, dy) / 3))

@@ -15,6 +15,16 @@ class Shot:
     distance: float
     horizontal_tolerance: float
     vertical_tolerance: float
+    flight: float = 0.0
+
+
+@dataclass(slots=True, frozen=True)
+class Engagement:
+    """Predicted first damage, lethal damage, and expected damage within 1 s."""
+
+    first_shot: float = math.inf
+    kill_time: float = math.inf
+    damage_1s: float = 0.0
 
 
 class Combat:
@@ -26,6 +36,8 @@ class Combat:
         self.steps = max(1, int(match["decide_every"]))
         self.frame = self.step * self.steps
         self.laser_wait = 0
+        self.observation = None
+        self.solutions = {}
 
     def dimensions(self, target):
         if target.get("kind") == "mech" or target["id"] < 16:
@@ -35,18 +47,6 @@ class Combat:
         group = "npc" if target.get("kind") == "npc" or target["id"] < 1000 else "crates"
         stats = self.config[group]
         return stats["radius"], stats["height"]
-
-    def visible(self, me, target):
-        """Check muzzle line of sight, including a target peeking over cover."""
-        if self.arena is None:
-            return True
-        p = me["pos"]
-        start = (p[0], p[1], p[2] + me["stats"]["muzzle_height"])
-        x, y, z = target["pos"]
-        _, height = self.dimensions(target)
-        return self.arena.clear(start, (x, y, z + height * 0.52)) or self.arena.clear(
-            start, (x, y, z + height * 0.86)
-        )
 
     def _lead(self, dx, dy, dz, velocity, speed, offset, gravity, ttl):
         """Solve the first ballistic intercept, including the muzzle offset."""
@@ -149,13 +149,25 @@ class Combat:
         if kind == "lightning":
             horizontal = math.radians(stats["cone_deg"]) * 0.49
             vertical = math.pi
-        return Shot(math.atan2(ey, ex), pitch, distance, horizontal, vertical)
+        return Shot(math.atan2(ey, ex), pitch, distance, horizontal, vertical, flight)
 
     def _shot(self, me, target, weapon, latency):
         shot = self._solution(me, target, weapon, latency, 0.52)
         if shot is None and weapon["kind"] in ("gun", "laser"):
             shot = self._solution(me, target, weapon, latency, 0.83)
         return shot
+
+    def _frame_shot(self, obs, target, weapon):
+        # Target ranking and execution use exactly the same firing lane.
+        if obs is not self.observation:
+            self.observation = obs
+            self.solutions.clear()
+        key = target["id"], weapon["kind"]
+        if key not in self.solutions:
+            cooldown = weapon.get("cooldown", 0)
+            latency = self.step * 0.55 + min(self.step, max(0, cooldown - self.step))
+            self.solutions[key] = self._shot(obs["self"], target, weapon, latency)
+        return self.solutions[key]
 
     def _heading_hits(self, me, aimed, shot, delay=0):
         """Check the aim after the first simulation step on which a shot can fire."""
@@ -175,43 +187,118 @@ class Combat:
             and abs(pitch - shot.pitch) <= shot.vertical_tolerance
         )
 
-    def _range(self, weapon):
+    def _turn_time(self, me, shot):
+        yaw, pitch = me["aim"]
+        stats = me["stats"]
+        return max(
+            max(0.0, abs(angle_error(shot.yaw, yaw)) - shot.horizontal_tolerance) / stats["turn_rate"],
+            max(0.0, abs(shot.pitch - pitch) - shot.vertical_tolerance) / stats["pitch_rate"],
+        )
+
+    def _shot_damage(self, me, target, weapon, shot, charge_fraction=1.0):
         stats = weapon["stats"]
-        return stats.get("range", stats.get("speed", 0) ** 2 / max(stats.get("gravity", 1), 1))
+        kind = weapon["kind"]
+        damage = stats["damage"]
+        cubes = self.config["cubes"]
+        damage *= 1 + cubes["damage_per_cube"] * min(me["cubes"], cubes["stat_cap"])
+        if kind == "laser":
+            minimum = stats["min_frac"]
+            damage *= minimum + (1 - minimum) * charge_fraction
+            if "mortar" in target.get("weapons", ()):
+                damage *= 1 + stats["cookoff"]
+        elif kind == "gun":
+            # Forecast the part of the spread cone inside the target width.
+            spread = max(0.001, math.radians(stats["spread_deg"]))
+            damage *= math.erf(shot.horizontal_tolerance / (math.sqrt(2) * spread))
+        elif kind == "mortar":
+            damage += stats["splash"] * 0.70
+        if target.get("kind") == "mech":
+            # A longer flight gives the opponent time to invalidate its current lead.
+            vx, vy, _ = target.get("vel", (0, 0, 0))
+            damage *= 0.94 / (1 + 0.55 * shot.flight * (1 + 0.2 * math.hypot(vx, vy)))
+        return damage
 
-    def select(self, obs, candidates, prior_id=None):
-        """Choose an in-range, shootable target with a bias toward finishing."""
+    def _ready_delay(self, me, weapon):
+        """Earliest trigger without changing the aim, excluding laser charge."""
+        kind = weapon["kind"]
+        cooldown = weapon.get("cooldown", 0)
+        if kind == "gun":
+            reload = weapon.get("reload", 0)
+            if weapon.get("ammo", 0) <= 0 and reload <= 0:
+                reload = weapon["stats"]["reload"]
+            return max(cooldown, reload)
+        if kind == "lightning":
+            reserve = 5 if me["grounded"] else 14
+            if me["energy"] < weapon["stats"]["energy"] + reserve:
+                return math.inf
+        return cooldown
+
+    def estimate(self, obs, target):
+        """Estimate burst and time to kill if current firing lanes persist.
+
+        The horizon is bounded. No reachable shot or kill within it returns
+        infinity. This is a tactical comparison, not a movement prediction.
+        """
         me = obs["self"]
-        x, y, _ = me["pos"]
-        weapons = [weapon for weapon in me["weapons"] if weapon]
-        reach = max((self._range(weapon) for weapon in weapons), default=0)
-        scored = []
-        for target in candidates:
-            tx, ty, _ = target["pos"]
-            distance = math.hypot(tx - x, ty - y)
-            if distance > reach + 10:
+        events = []
+        horizon = 8.0
+        for weapon in me["weapons"]:
+            if weapon is None:
                 continue
-            remaining = min(1.5, target.get("hp", 1400) / 1400)
-            turn = abs(angle_error(math.atan2(ty - y, tx - x), me["aim"][0]))
-            score = distance * 0.55 + 66 * remaining + 12 * turn
-            if target["id"] == prior_id:
-                score -= 14
-            elif target.get("charging") and distance < 90:
-                score -= 7
-            scored.append((score, target["id"], target))
-        scored.sort()
-        for _, _, target in scored[:5]:
-            if self.visible(me, target):
-                return target
-        mortar = next((w for w in weapons if w["kind"] == "mortar" and
-                       w["cooldown"] <= self.frame + 0.20), None)
-        if mortar:
-            for _, _, target in scored[:2]:
-                if self._shot(me, target, mortar, self.step):
-                    return target
-        return None
+            kind, stats = weapon["kind"], weapon["stats"]
+            delay = self._ready_delay(me, weapon)
+            if delay >= horizon:
+                continue
+            shot = self._frame_shot(obs, target, weapon)
+            if shot is None:
+                continue
+            turn = self._turn_time(me, shot)
+            damage = self._shot_damage(me, target, weapon, shot)
+            interval = max(self.step, stats["cooldown"])
+            ammo = weapon.get("ammo", 0)
+            limit = 40
+            opening_damage = damage
+            if kind == "laser":
+                if "lightning" in target.get("weapons", ()) and shot.distance < 48 and not weapon.get("charge", 0):
+                    continue
+                goal = self._charge_goal(me, target, weapon)
+                charge = weapon.get("charge", 0)
+                delay += max(0.0, goal - charge)
+                opening_damage = self._shot_damage(me, target, weapon, shot, min(1, max(goal, charge) / stats["charge"]))
+                interval += stats["charge"]
+            elif kind == "gun" and (ammo <= 0 or weapon.get("reload", 0) > 0):
+                ammo = int(stats["mag"])
+            elif kind == "lightning":
+                reserve = 5 if me["grounded"] else 14
+                limit = min(limit, max(0, int((me["energy"] - reserve) / max(0.01, stats["energy"]))))
+            impact = max(self.step, turn, delay) + shot.flight
+            for index in range(limit):
+                if impact > horizon:
+                    break
+                events.append((impact, opening_damage if index == 0 else damage))
+                if kind == "gun":
+                    ammo -= 1
+                    if ammo <= 0:
+                        impact += stats["reload"]
+                        ammo = int(stats["mag"])
+                        continue
+                impact += interval
+        if not events:
+            return Engagement()
+        events.sort()
+        hp = target.get("hp", target.get("max_hp", 1400))
+        dealt = 0.0
+        kill_time = math.inf
+        damage_1s = 0.0
+        for impact, damage in events:
+            dealt += damage
+            if impact <= 1.0:
+                damage_1s += damage
+            if dealt >= hp and kill_time == math.inf:
+                kill_time = impact
+        return Engagement(events[0][0], kill_time, damage_1s)
 
-    def apply(self, action, obs, target, scan_yaw, allow_fire=True):
+    def apply(self, action, obs, target, scan_yaw, allow_new_charge=True):
         me = obs["self"]
         weapons = me["weapons"]
         action["aim"] = [math.remainder(scan_yaw, math.tau), 0]
@@ -233,11 +320,6 @@ class Combat:
         pitch = math.atan2(t[2] - p[2] + 0.52 * height - own["muzzle_height"], distance)
         default = Shot(yaw, min(own["max_pitch"], max(own["min_pitch"], pitch)), distance, 0, 0)
         action["aim"] = [default.yaw, default.pitch]
-        if not allow_fire:
-            self.laser_wait = 0
-            action["reload"] = bool(gun and 0 < gun.get("ammo", 0) < gun["stats"]["mag"])
-            return action
-
         shots = {}
         laser = None
         charge_goal = 0.0
@@ -253,51 +335,53 @@ class Combat:
             if kind == "lightning" and (cooldown > self.frame + 0.05 or distance > weapon["stats"]["range"] + 2):
                 continue
             if kind == "laser":
+                if not allow_new_charge and not weapon.get("charge", 0):
+                    continue
                 if cooldown > self.frame and not weapon.get("charge", 0):
                     continue
                 laser = slot
                 charge_goal = self._charge_goal(me, target, weapon)
                 if not weapon.get("charge", 0) and "lightning" in target.get("weapons", ()) and distance < 48:
                     continue
-            latency = self.step * 0.55 + min(self.step, max(0, cooldown - self.step))
-            shot = self._shot(me, target, weapon, latency)
+            shot = self._frame_shot(obs, target, weapon)
             if shot is not None:
                 shots[slot] = shot
 
-        aim = default
-        best = -1
+        delays = {}
+        damage = {}
+        preparation = {}
         for slot, shot in shots.items():
             weapon = weapons[slot]
             kind = weapon["kind"]
-            if kind == "gun":
-                score = 30
-            elif kind == "lightning":
-                score = 22 if gun else 36
-            elif kind == "mortar":
-                score = 60
-            else:
-                charge = weapon.get("charge", 0)
-                # Track the gun while charging until it is time to release.
-                score = 80 if charge >= charge_goal - 0.04 else 27
-            if score > best:
-                best, aim = score, shot
-        action["aim"] = [aim.yaw, aim.pitch]
-
-        for slot, shot in shots.items():
-            weapon = weapons[slot]
-            kind = weapon["kind"]
+            delay = self._ready_delay(me, weapon)
+            fraction = 1.0
             if kind == "laser":
-                continue
-            if weapon.get("cooldown", 0) > self.frame + 1e-4:
-                continue
-            if kind == "gun" and (weapon.get("ammo", 0) <= 0 or weapon.get("reload", 0) > self.frame):
-                continue
-            if kind == "lightning":
-                cost = weapon["stats"]["energy"]
-                reserve = 14 if not me["grounded"] else 5
-                if me["energy"] < cost + reserve:
-                    continue
-            action["fire"][slot] = self._heading_hits(me, aim, shot, weapon.get("cooldown", 0))
+                charge = weapon.get("charge", 0)
+                delay = max(delay, charge_goal - charge)
+                fraction = min(1, max(charge, charge_goal) / weapon["stats"]["charge"])
+                if not charge or charge < charge_goal - 1e-3:
+                    delay = max(delay, self.frame + self.step)
+            if delay <= self.frame + 1e-4 and not (kind == "gun" and weapon.get("ammo", 0) <= 0):
+                delays[slot] = delay
+                damage[slot] = self._shot_damage(me, target, weapon, shot, fraction)
+            # Prefer aim that can use a soon-to-ready secondary when no shot
+            # can land this frame. Do not let pre-aim block a payable shot.
+            preparation[slot] = max(self._turn_time(me, shot), delay) + shot.flight * 0.22
+
+        aim = default
+        fire_now = ()
+        best = None
+        hp = target.get("hp", math.inf)
+        for slot, shot in shots.items():
+            ready = tuple(i for i, delay in delays.items() if self._heading_hits(me, shot, shots[i], delay))
+            expected = sum(damage[i] for i in ready)
+            score = (expected >= hp, expected, -preparation[slot])
+            if best is None or score > best:
+                best, aim, fire_now = score, shot, ready
+        action["aim"] = [aim.yaw, aim.pitch]
+        for slot in fire_now:
+            if slot != laser:
+                action["fire"][slot] = True
 
         if laser is not None:
             weapon = weapons[laser]
@@ -305,7 +389,7 @@ class Combat:
             shot = shots.get(laser)
             if charge:
                 ready = charge >= charge_goal - 1e-3
-                aligned = self._heading_hits(me, aim, shot)
+                aligned = laser in fire_now
                 self.laser_wait = self.laser_wait + self.frame if ready or shot is None else 0
                 action["fire"][laser] = not (ready and aligned or self.laser_wait > 0.45)
             elif shot is not None:
