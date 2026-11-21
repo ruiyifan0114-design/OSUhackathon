@@ -1,6 +1,6 @@
 """Aim and weapon timing for the mechfight/1 simulator."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 
 
@@ -16,6 +16,9 @@ class Shot:
     horizontal_tolerance: float
     vertical_tolerance: float
     flight: float = 0.0
+    impact: tuple | None = None
+    splash: float | None = None
+    collateral: float = 0.0
 
 
 @dataclass(slots=True, frozen=True)
@@ -25,6 +28,7 @@ class Engagement:
     first_shot: float = math.inf
     kill_time: float = math.inf
     damage_1s: float = 0.0
+    interrupt: float = 0.0
 
 
 class Combat:
@@ -38,6 +42,8 @@ class Combat:
         self.laser_wait = 0
         self.observation = None
         self.solutions = {}
+        self.arc_lanes = {}
+        self.arc_results = {}
 
     def dimensions(self, target):
         if target.get("kind") == "mech" or target["id"] < 16:
@@ -149,7 +155,65 @@ class Combat:
         if kind == "lightning":
             horizontal = math.radians(stats["cone_deg"]) * 0.49
             vertical = math.pi
-        return Shot(math.atan2(ey, ex), pitch, distance, horizontal, vertical, flight)
+        return Shot(math.atan2(ey, ex), pitch, distance, horizontal, vertical, flight, endpoint)
+
+    def _cluster_mortar(self, obs, target, weapon, latency, direct):
+        """Try one ground shot between two nearby mechs using predicted positions."""
+        if target.get("kind") != "mech" or self.arena is None or weapon["cooldown"] > 0.25:
+            return direct
+        stats = weapon["stats"]
+        splash_range = stats["splash_radius"]
+        x, y, z = target["pos"]
+        neighbors = []
+        for foe in obs["mechs"]:
+            if foe["id"] == target["id"] or foe.get("kind") != "mech":
+                continue
+            fx, fy, fz = foe["pos"]
+            d = math.hypot(fx - x, fy - y)
+            if abs(fz - z) <= 3 and 3 <= d <= splash_range * 1.55:
+                neighbors.append((d, foe["id"], foe))
+        if not neighbors:
+            return direct
+        _, _, other = min(neighbors)
+        point = tuple((a + b) * 0.5 for a, b in zip(target["pos"], other["pos"]))
+        ground = self.arena.ground(*point[:2])
+        if ground is None or abs(point[2] - ground) > 1.2:
+            return direct
+        velocity = tuple((a + b) * 0.5 for a, b in zip(target["vel"], other["vel"]))
+        virtual = {"id": target["id"], "kind": "mech", "pos": (*point[:2], ground + 0.20),
+                   "vel": (*velocity[:2], 0)}
+        shot = self._solution(obs["self"], virtual, weapon, latency, 0)
+        if shot is None:
+            return direct
+        landing = self.arena.ground(*shot.impact[:2])
+        if landing is None or abs(landing - shot.impact[2]) > 0.6:
+            return direct
+
+        def factor(foe):
+            travel = shot.flight + latency
+            feet = tuple(p + v * travel for p, v in zip(foe["pos"], foe["vel"]))
+            separation = math.dist(shot.impact, (feet[0], feet[1], feet[2] + 0.8))
+            if separation >= splash_range or not self.arena.clear(
+                    (shot.impact[0], shot.impact[1], landing + 0.4), (feet[0], feet[1], feet[2] + 1.5)):
+                return 0.0
+            return 1 - (1 - stats["splash_edge"]) * separation / splash_range
+
+        primary, extra = factor(target), factor(other)
+        if primary <= 0 or extra <= 0:
+            return direct
+        tolerance = math.atan2(1.3, max(1.0, shot.distance))
+        cluster = replace(shot, horizontal_tolerance=tolerance, vertical_tolerance=tolerance,
+                          splash=primary, collateral=stats["splash"] * extra * 0.5)
+        cluster_damage, _ = self._shot_damage(obs["self"], target, weapon, cluster)
+        if direct is None:
+            return cluster
+        direct_damage, _ = self._shot_damage(obs["self"], target, weapon, direct)
+        # Allow a cluster shot to beat a long, uncertain direct shot, but do
+        # not give up an immediate direct finish on the selected target.
+        hp = target.get("hp") or target.get("max_hp") or 1400
+        if direct_damage < hp and cluster_damage + cluster.collateral > direct_damage:
+            return cluster
+        return direct
 
     def _shot(self, me, target, weapon, latency):
         shot = self._solution(me, target, weapon, latency, 0.52)
@@ -157,22 +221,35 @@ class Combat:
             shot = self._solution(me, target, weapon, latency, 0.83)
         return shot
 
-    def _frame_shot(self, obs, target, weapon):
-        # Target ranking and execution use exactly the same firing lane.
+    def _begin_frame(self, obs):
         if obs is not self.observation:
             self.observation = obs
             self.solutions.clear()
+            self.arc_lanes.clear()
+            self.arc_results.clear()
+
+    def _frame_shot(self, obs, target, weapon):
+        # Target ranking and execution use exactly the same firing lane.
+        self._begin_frame(obs)
         key = target["id"], weapon["kind"]
         if key not in self.solutions:
             cooldown = weapon.get("cooldown", 0)
             latency = self.step * 0.55 + min(self.step, max(0, cooldown - self.step))
-            self.solutions[key] = self._shot(obs["self"], target, weapon, latency)
+            shot = self._shot(obs["self"], target, weapon, latency)
+            if weapon["kind"] == "mortar":
+                shot = self._cluster_mortar(obs, target, weapon, latency, shot)
+            self.solutions[key] = shot
         return self.solutions[key]
 
     def _heading_hits(self, me, aimed, shot, delay=0):
         """Check the aim after the first simulation step on which a shot can fire."""
-        if shot is None:
-            return False
+        yaw, pitch = self._slewed_aim(me, aimed, delay)
+        return (
+            abs(angle_error(yaw, shot.yaw)) <= shot.horizontal_tolerance
+            and abs(pitch - shot.pitch) <= shot.vertical_tolerance
+        )
+
+    def _slewed_aim(self, me, aimed, delay):
         steps = min(self.steps, max(1, math.ceil((delay - 1e-6) / self.step)))
         elapsed = steps * self.step
         own_yaw, own_pitch = me["aim"]
@@ -182,10 +259,73 @@ class Combat:
         pitch_step = me["stats"]["pitch_rate"] * elapsed
         yaw = own_yaw + min(yaw_step, max(-yaw_step, yaw_delta))
         pitch = own_pitch + min(pitch_step, max(-pitch_step, pitch_delta))
-        return (
-            abs(angle_error(yaw, shot.yaw)) <= shot.horizontal_tolerance
-            and abs(pitch - shot.pitch) <= shot.vertical_tolerance
-        )
+        return yaw, pitch
+
+    def _arc_clear(self, start, end):
+        key = start, end
+        if key not in self.arc_lanes:
+            self.arc_lanes[key] = self.arena is None or self.arena.clear(start, end)
+        return self.arc_lanes[key]
+
+    def arc_hits(self, obs, weapon, yaw):
+        """Resolve the nearest legal first hit and nearest visible bounces.
+
+        Uses observed positions. The server may also know actors hidden from us.
+        """
+        self._begin_frame(obs)
+        key = id(weapon), yaw
+        if key in self.arc_results:
+            return self.arc_results[key]
+        me, stats = obs["self"], weapon["stats"]
+        x, y, z = me["pos"]
+        origin = (x, y, z + me["stats"]["muzzle_height"])
+        reach = stats["range"] + stats["chain"] * stats["chain_range"]
+        cone = math.radians(stats["cone_deg"]) * 0.5
+        pool = []
+        for actor in (*obs["mechs"], *obs["crates"]):
+            if actor["id"] == me["id"] or actor.get("hp") == 0:
+                continue
+            ax, ay, az = actor["pos"]
+            if math.hypot(ax - x, ay - y) > reach:
+                continue
+            _, height = self.dimensions(actor)
+            point = (ax, ay, az + height * 0.52)
+            pool.append((actor["id"], actor, point))
+        hits = []
+        previous = origin
+        for jump in range(int(stats["chain"]) + 1):
+            limit = stats["chain_range"] if jump else stats["range"]
+            candidates = []
+            for identity, actor, point in pool:
+                if not jump and abs(angle_error(math.atan2(point[1] - y, point[0] - x), yaw)) > cone:
+                    continue
+                d = math.dist(previous, point)
+                if d <= limit:
+                    candidates.append((d, identity, actor, point))
+            chosen = next((entry for entry in sorted(candidates)
+                           if self._arc_clear(previous, entry[3])), None)
+            if chosen is None:
+                break
+            _, identity, actor, point = chosen
+            incoming = math.atan2(point[1] - previous[1], point[0] - previous[0])
+            hits.append((actor, stats["chain_falloff"] ** jump, incoming))
+            pool = [entry for entry in pool if entry[0] != identity]
+            previous = point
+        self.arc_results[key] = hits
+        return hits
+
+    def _arc_value(self, obs, target, weapon, shot, yaw):
+        expected = connected = utility = interrupt = 0.0
+        for actor, falloff, incoming in self.arc_hits(obs, weapon, yaw):
+            arc = Shot(incoming, shot.pitch, shot.distance, 0, 0)
+            mean, direct = self._shot_damage(obs["self"], actor, weapon, arc)
+            if actor["id"] == target["id"]:
+                expected, connected = mean * falloff, direct * falloff
+            elif actor.get("kind") == "mech":
+                utility += mean * falloff * 0.30
+            if actor.get("charging") and "laser" in actor.get("weapons", ()):
+                interrupt += 48
+        return expected, connected, utility, interrupt
 
     def _turn_time(self, me, shot):
         yaw, pitch = me["aim"]
@@ -241,7 +381,10 @@ class Combat:
             spread = max(0.001, math.radians(stats["spread_deg"]))
             accuracy = math.erf(shot.horizontal_tolerance / (math.sqrt(2) * spread))
         elif kind == "mortar":
-            damage += stats["splash"] * 0.70
+            if shot.splash is None:
+                damage += stats["splash"] * 0.70
+            else:
+                damage *= stats["splash"] * shot.splash / stats["damage"]
         if target.get("kind") == "mech":
             # A longer flight gives the opponent time to invalidate its current lead.
             vx, vy, _ = target.get("vel", (0, 0, 0))
@@ -274,6 +417,7 @@ class Combat:
         """
         me = obs["self"]
         schedules = []
+        interrupt = 0.0
         horizon = 8.0
         for weapon in me["weapons"]:
             if weapon is None:
@@ -304,6 +448,10 @@ class Combat:
             elif kind == "gun" and (ammo <= 0 or weapon.get("reload", 0) > 0):
                 ammo = int(stats["mag"])
             elif kind == "lightning":
+                damage, _, _, interrupt = self._arc_value(obs, target, weapon, shot, shot.yaw)
+                opening_damage = damage
+                if damage <= 0:
+                    continue
                 reserve = 5 if me["grounded"] else 14
                 limit = min(limit, max(0, int((me["energy"] - reserve) / max(0.01, stats["energy"]))))
             trigger = max(self.step, turn, delay)
@@ -341,7 +489,7 @@ class Combat:
                 damage_1s += damage
             if dealt >= hp and kill_time == math.inf:
                 kill_time = impact
-        return Engagement(events[0][0], kill_time, damage_1s)
+        return Engagement(events[0][0], kill_time, damage_1s, interrupt)
 
     def _combine_schedules(self, me, schedules, horizon):
         (first, left), (second, right) = schedules
@@ -448,16 +596,32 @@ class Combat:
         aim = default
         fire_now = ()
         best = None
-        hp = target.get("hp", math.inf)
+        hp = target.get("hp") if target.get("hp") is not None else math.inf
         candidates = [(shot, preparation[slot]) for slot, shot in shots.items()]
         if len(ready_weapons) == 2:
             shared = self._shared_aim(shots[0], shots[1])
             if shared is not None:
                 candidates.append((shared, max(preparation.values())))
         for shot, prepare in candidates:
-            ready = tuple(slot for slot, data in ready_weapons.items()
-                          if self._heading_hits(me, shot, shots[slot], data[0]))
-            score = self._burst_score(ready, ready_weapons, hp, prepare)
+            data = ready_weapons.copy()
+            tactical_value = 0.0
+            for slot, item in ready_weapons.items():
+                weapon = weapons[slot]
+                if weapon["kind"] != "lightning":
+                    continue
+                yaw, _ = self._slewed_aim(me, shot, item[0])
+                mean, direct, extra, interrupt = self._arc_value(obs, target, weapon, shots[slot], yaw)
+                if not mean and not interrupt and extra < 22:
+                    del data[slot]
+                    continue
+                data[slot] = (item[0], item[1], mean, direct)
+                tactical_value += extra + interrupt
+            ready = tuple(slot for slot, item in data.items()
+                          if weapons[slot]["kind"] == "lightning"
+                          or self._heading_hits(me, shot, shots[slot], item[0]))
+            lethal, time, value, preaim = self._burst_score(ready, data, hp, prepare)
+            tactical_value += sum(shots[slot].collateral for slot in ready)
+            score = lethal, time, value + tactical_value, preaim
             if best is None or score > best:
                 best, aim, fire_now = score, shot, ready
         action["aim"] = [aim.yaw, aim.pitch]
