@@ -229,9 +229,7 @@ class Arena:
         if self.terrain is None or zmin >= self.highest_ground:
             return True
         # Sample in horizontal distance because the height field is 2-D.
-        # Coarser steps missed short ridges in the map tests; 1.5 m keeps the
-        # cost bounded while staying below the 1 m terrain feature scale.
-        steps = max(1, math.ceil(math.hypot(dx, dy) / 1.5))
+        steps = max(1, math.ceil(math.hypot(dx, dy) / 3))
         for i in range(1, steps + 1):
             t = i / steps
             z = self.ground(ax + t * dx, ay + t * dy)
@@ -249,10 +247,7 @@ class Arena:
         # to avoid predicting a collision just because reported coordinates round.
         radius = max(0.0, radius - 0.2)
         length = math.hypot(dx, dy)
-        # The terrain grid is 1 m.  Sampling at the old 1.5-2.5 m stride could
-        # step over a short vertical ledge and report a blocked cliff as
-        # walkable.  One-metre samples match the resolution the server uses.
-        steps = max(1, math.ceil(length))
+        steps = max(1, math.ceil(length / max(1.5, radius)))
         stride = length / steps
         max_rise = max(step_up, stride * self.slope) + 0.05
         prisms = self._nearby(min(ax, ax + dx) - radius, min(ay, ay + dy) - radius,
