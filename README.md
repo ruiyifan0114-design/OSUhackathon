@@ -34,21 +34,4 @@ python3 /path/to/mechfight-kit/check/check.py \
 
 The conformance checker only validates protocol and timing; it is not a match simulator.
 
-## Recorded match evaluation
-
-If you have saved observation and end messages, pass one JSONL or gzip JSONL
-file per match to the offline evaluator. It reports placement points, finish
-times, weapon damage, and survival confirmed by observations after a kill.
-Logs containing `{"obs": ..., "action": ...}` records with the bot's debug
-labels also report how often a finish attempt turns into a confirmed kill.
-For paired comparisons, give matches from the same seed and slot the same
-filename in each directory.
-
-```sh
-python3 tools/evaluate.py runs/current/*.jsonl --baseline runs/baseline/*.jsonl
-```
-
-Recorded observations and synthetic tests cannot measure counterfactual
-match results. Use official practice runs for the placement score.
-
 The original Oval Runner code is released under the MIT License.

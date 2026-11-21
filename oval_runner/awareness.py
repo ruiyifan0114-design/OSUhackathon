@@ -59,6 +59,9 @@ class Awareness:
     """Keep a small, recency-weighted memory of heard enemy activity."""
 
     def __init__(self, hello):
+        sound = hello.get("config", {}).get("sound", {})
+        self.near = float(sound.get("near", 60))
+        self.mid = float(sound.get("mid", 160))
         self.contacts = []
 
     def update(self, obs):
@@ -84,7 +87,7 @@ class Awareness:
             duplicate = next(
                 (c for c in self.contacts
                  if c.kind == kind and c.bucket == bucket
-                 and abs(heard - c.heard_at) < 0.30
+                 and heard - c.heard_at < 0.30
                  and abs(math.remainder(c.bearing - bearing, math.tau)) < 0.20),
                 None,
             )
@@ -113,3 +116,11 @@ class Awareness:
         if best is None or best_score < 8.0:
             return None
         return best
+
+    def scan_bearing(self, now, max_age=2.5):
+        contact = self.alert(now, max_age=max_age)
+        return contact.bearing if contact is not None else None
+
+    def pressure(self, now, max_age=2.4):
+        contact = self.alert(now, max_age=max_age)
+        return contact.score(now) if contact is not None else 0.0

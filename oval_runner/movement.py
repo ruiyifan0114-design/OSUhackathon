@@ -213,9 +213,6 @@ class Movement:
         # High-speed arrivals need a little more braking distance; pickup
         # radii are 3.5-4 m, so these still stop inside them.
         stop_radius = {"farm": 18, "drop": 3.2, "cube": 2.6, "weapon": 3.2}.get(mode, 2.0)
-        terminal = mode == "zone" and zone["next_radius"] == 0 and zone["shrink_end"] - now < 10
-        if terminal and goal is not None and distance(goal, zone["next_center"]) < 1:
-            stop_radius = 0.28
         if mode == "farm" and goal is not None:
             eye = (pos[0], pos[1], pos[2] + stats["muzzle_height"])
             if not self.arena.clear(eye, (goal[0], goal[1], goal[2] + 1.25)):
@@ -330,8 +327,14 @@ class Movement:
                 attack_facing = math.cos(yaw), math.sin(yaw)
             accel = stats["ground_accel"] if me["grounded"] else stats["air_accel"]
             turn = 0.5 * accel / max(1, speed)
-            predictions = [(hit[0] - pos[0] - t * vx, hit[1] - pos[1] - t * vy, t, safe, severity)
-                           for _, t, hit, safe, severity, _ in hazards]
+            # Acceleration is common to all headings. Keep only the steering-dependent term
+            # inside the candidate loop.
+            predictions = []
+            for _, t, hit, safe, severity, _ in hazards:
+                gain = min(1.0, t * turn)
+                predictions.append((hit[0] - pos[0] - t * vx * (1 - gain),
+                                    hit[1] - pos[1] - t * vy * (1 - gain),
+                                    t, safe, severity))
             beam_gain = min(1.0, 0.36 * turn)
             for along, across in ANGLES:
                 ux, uy = dx * along - dy * across, dy * along + dx * across
@@ -381,11 +384,13 @@ class Movement:
                         score -= 1.35 * max(0, radius + 2 - self.beam_margin(near_point, beam, height))
                         score -= 0.35 * max(0, radius + 5 - self.beam_margin(endpoint, beam, height))
 
-                change_x, change_y = ux * speed * fraction - vx, uy * speed * fraction - vy
-                ramp = math.hypot(change_x, change_y) / max(0.1, accel)
                 for x, y, t, safe, severity in predictions:
-                    gain = 0.5 * t * t / ramp if t < ramp else t - 0.5 * ramp
-                    margin = math.hypot(x - change_x * gain, y - change_y * gain) - safe
+                    # The candidate can displace at most speed * t (and only
+                    # as far as the clear fraction allows).  This used to be a
+                    # dimensionless gain*fraction, which capped the dodge at
+                    # one metre regardless of speed or warning time.
+                    available = min(t, reach / max(1.0, speed)) * speed * fraction
+                    margin = math.hypot(x - ux * available, y - uy * available) - safe
                     score -= severity * max(0, 1 - margin / max(1, safe))
                 if score > max_score:
                     max_score, best = score, (ux, uy, fraction)
@@ -400,7 +405,3 @@ class Movement:
         self.last_heading = (ux, uy)
         action["move"] = [ux, uy]
         action["boost"] = bool(ground_boost or not me["grounded"] and now < self.jet_until and energy > 18)
-        if terminal and traveling and goal_distance < 4 and not hazards and not beams:
-            scale = min(1.0, goal_distance / 3.5)
-            action["move"] = [ux * scale, uy * scale]
-            action["boost"] = False
