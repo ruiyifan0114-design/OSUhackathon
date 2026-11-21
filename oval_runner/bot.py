@@ -207,8 +207,13 @@ class Bot:
         # trade: it slows us down and telegraphs the beam.  Keep the gun or a
         # covered secondary instead.
         suppress_laser = bool(laser and (laser[1] or laser[2] < 180))
+        # Charging while travelling halves our speed.  Only commit to a new
+        # charge in an actual engagement, never while merely moving to zone,
+        # loot, or a cover point.
+        allow_laser_charge = (not escaping and not suppress_laser
+                              and mode in ("fight", "finish"))
         self.combat.apply(action, obs, target, scan,
-                          allow_new_charge=not escaping and not suppress_laser)
+                          allow_new_charge=allow_laser_charge)
         if target is None and not escaping and alert is not None:
             self.blind_lightning(action, obs, alert)
         if secondary and secondary["kind"] == "laser" and (escaping or suppress_laser):
@@ -268,11 +273,30 @@ class Bot:
         action["fire"][1] = True
 
     def laser_threat(self, threats, obs):
-        """Find visible laser carriers; only exposed threats reach this list."""
-        foes = [foe for _, _, foe in threats if "laser" in foe.get("weapons", ())]
+        """Find visible laser carriers that can actually bring the beam to bear."""
+        me = obs["self"]
+        pos = me["pos"]
+        now = obs["t"]
+        foes = []
+        for _, _, foe in threats:
+            if "laser" not in foe.get("weapons", ()):
+                continue
+            charging = bool(foe.get("charging"))
+            # A laser on cooldown is not an immediate reason to abandon a
+            # good position.  A charging laser is, because release can happen
+            # before the cooldown would otherwise matter.
+            if not charging and now < self.laser_cooldown.get(foe["id"], 0):
+                continue
+            bearing = math.atan2(pos[1] - foe["pos"][1], pos[0] - foe["pos"][0])
+            error = abs(math.remainder(foe["aim"][0] - bearing, math.tau))
+            # If the torso is pointing away, turning it far enough to hit is
+            # itself a warning.  This avoids retreating from every laser
+            # carrier that merely has line of sight.
+            if error > (1.15 if charging else 0.75):
+                continue
+            foes.append(foe)
         if not foes:
             return None
-        pos = obs["self"]["pos"]
         return foes, any(foe.get("charging") for foe in foes), min(
             distance(pos, foe["pos"]) for foe in foes
         )
@@ -311,7 +335,7 @@ class Bot:
                     stats["height"], stats["step_up"]) == 1.0:
                 return x, y, pos[2]
         if distance(pos, zone_goal) > 12:
-            return zone_goal
+            return zone_goal[0], zone_goal[1], pos[2]
         return pos[0] - 18 * cos, pos[1] - 18 * sin, pos[2]
 
     def threats(self, obs, nearby):

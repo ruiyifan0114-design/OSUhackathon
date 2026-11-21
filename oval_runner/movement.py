@@ -187,6 +187,8 @@ class Movement:
         me = obs["self"]
         now = obs["t"]
         pos = me["pos"]
+        if goal is not None and len(goal) < 3:
+            goal = (goal[0], goal[1], pos[2])
         vx, vy, _ = me["vel"]
         stats = me["stats"]
         zone = obs["zone"]
