@@ -27,6 +27,9 @@ class Movement:
         self.recover_until = 0
         self.boost_until = 0
         self.jet_until = 0
+        self.anchor_goal = None
+        self.bypass = None
+        self.next_bypass_at = 0.0
 
     def enemy_arc_range(self, target):
         if "lightning" not in target.get("weapons", ()):
@@ -89,7 +92,7 @@ class Movement:
         return pos[0] + dx * 27, pos[1] + dy * 27, pos[2]
 
     def cover_goal(self, obs, enemies, zone_goal):
-        """Find a nearby reachable firing-line break, or hold existing cover."""
+        """Prefer hard cover with a short approach and a second exit."""
         me = obs["self"]
         pos, stat, zone = me["pos"], me["stats"], obs["zone"]
         foes = [foe for foe in enemies[:2] if distance(pos, foe["pos"]) < 155]
@@ -98,47 +101,131 @@ class Movement:
         eyes = [(foe["pos"][0], foe["pos"][1], foe["pos"][2] + 7) for foe in foes]
         height = stat["height"]
         margin = zone["radius"] - distance(pos, zone["center"])
+        clearance = stat["radius"] + 0.45, height, stat["step_up"]
+        base_ground = self.arena.ground(*pos[:2])
+        on_ground = base_ground is not None and abs(pos[2] - base_ground) < 1.4
 
-        def exposure(point):
+        def point_at(x, y):
+            ground = self.arena.ground(x, y) if on_ground else None
+            return x, y, pos[2] if ground is None else ground
+
+        def exposure(point, future=False):
             chest = (point[0], point[1], point[2] + height * 0.66)
             head = (point[0], point[1], point[2] + height * 0.9)
-            return sum((1.0 if index == 0 else 0.8) for index, eye in enumerate(eyes)
-                       if self.arena.clear(eye, chest) or self.arena.clear(eye, head))
+            total = 0
+            for index, (eye, foe) in enumerate(zip(eyes, foes)):
+                if future:
+                    vx, vy, _ = foe.get("vel", (0, 0, 0))
+                    advanced = eye[0] + vx * 0.38, eye[1] + vy * 0.38, eye[2]
+                    if self.arena.clear(eye, advanced):
+                        eye = advanced
+                if self.arena.clear(eye, chest) or self.arena.clear(eye, head):
+                    total += 1.0 if index == 0 else 0.8
+            return total
 
         current = exposure(pos)
-        if not current and margin > 10 and distance(pos, zone_goal) < 27:
-            return pos
         away_x, away_y = unit(pos[0] - eyes[0][0], pos[1] - eyes[0][1])
         if not (away_x or away_y):
             away_x, away_y = (1, 0)
+
+        def exits(point, forward):
+            # An entrance alone is not a retreat route. Try the forward lane
+            # and both side exits, all with a small clearance margin.
+            fx, fy = forward
+            return sum(self.arena.walk_fraction(point, dx * 6, dy * 6, *clearance) >= 0.99
+                       and distance((point[0] + dx * 6, point[1] + dy * 6), zone["center"])
+                       < zone["radius"] - 1
+                       for dx, dy in ((fx, fy), (-fy, fx), (fy, -fx)))
+
+        if not current and margin > 10 and distance(pos, zone_goal) < 27:
+            if exits(pos, (away_x, away_y)):
+                return pos
+
         vx, vy, _ = me["vel"]
         now = obs["t"]
-        base_ground = self.arena.ground(pos[0], pos[1])
-        on_ground = base_ground is not None and pos[2] - base_ground < 1.4
-        best, best_score = None, 0
+        candidates = []
         for along, across in ANGLES[:11]:
             ux, uy = away_x * along - away_y * across, away_y * along + away_x * across
-            for length in (12, 24):
+            for length in (8, 15, 24):
                 dx, dy = ux * length, uy * length
-                if self.arena.walk_fraction(pos, dx, dy, stat["radius"], height, stat["step_up"]) < 1.0:
+                if self.arena.walk_fraction(pos, dx, dy, *clearance) < 0.99:
                     break
-                point = [pos[0] + dx, pos[1] + dy, pos[2]]
-                if on_ground:
-                    ground = self.arena.ground(point[0], point[1])
-                    if ground is not None:
-                        point[2] = ground
+                point = point_at(pos[0] + dx, pos[1] + dy)
+                if abs(point[2] - pos[2]) > 4:
+                    continue
                 room = zone["radius"] - distance(point, zone["center"])
                 if room < min(2, margin):
                     continue
                 next_room = zone["next_radius"] - distance(point, zone["next_center"])
                 next_cost = max(0, -next_room) * max(0.03, min(0.4, (28 - (zone["shrink_end"] - now)) * 0.016))
                 remaining = exposure(point)
+                if remaining > current or (current and remaining >= current):
+                    continue
                 score = (11 * (current - remaining) - length * 0.14 - next_cost
                          - max(0, 15 - room) * 0.36 + (ux * vx + uy * vy) * 0.10)
-                if score > best_score and remaining < current:
-                    best, best_score = point, score
-                if not remaining:
+                candidates.append((score, point, (ux, uy), remaining))
+
+        best, best_score = None, -math.inf
+        for score, point, direction, remaining in sorted(candidates, reverse=True)[:5]:
+            retreat_lanes = exits(point, direction)
+            if not retreat_lanes:
+                continue
+            midpoint = point_at((pos[0] + point[0]) / 2, (pos[1] + point[1]) / 2)
+            future = exposure(point, future=True)
+            if current and future >= current:
+                continue
+            score += 1.6 * retreat_lanes - 2.8 * exposure(midpoint) - 3.2 * max(0, future - remaining)
+            if score > best_score:
+                best, best_score = point, score
+        return best
+
+    def bypass_goal(self, obs, goal, direction, direct):
+        """Find a short, two-leg detour when the desired route hits a solid."""
+        pos, stats, now = obs["self"]["pos"], obs["self"]["stats"], obs["t"]
+        clearance = stats["radius"] + 0.35, stats["height"], stats["step_up"]
+        if self.bypass:
+            point, destination, expiry = self.bypass
+            if now < expiry and distance(goal, destination) < 9 and distance(pos, point) > 2.4:
+                if self.arena.walk_fraction(pos, point[0] - pos[0], point[1] - pos[1], *clearance) >= 0.99:
+                    return point
+            self.bypass = None
+        if direct >= 0.99 or now < self.next_bypass_at:
+            return None
+        self.next_bypass_at = now + 0.30
+        dx, dy = direction
+        best, best_score = None, -math.inf
+        current = distance(pos, goal)
+        zone = obs["zone"]
+        room = zone["radius"] - distance(pos, zone["center"])
+        ground = self.arena.ground(*pos[:2])
+        on_ground = ground is not None and abs(pos[2] - ground) < 1.4
+        for along, across in ANGLES[3:]:
+            ux, uy = dx * along - dy * across, dy * along + dx * across
+            for length in (8, 14):
+                if self.arena.walk_fraction(pos, ux * length, uy * length, *clearance) < 0.99:
                     break
+                x, y = pos[0] + ux * length, pos[1] + uy * length
+                z = self.arena.ground(x, y) if on_ground else None
+                point = x, y, pos[2] if z is None else z
+                if abs(point[2] - pos[2]) > 4:
+                    continue
+                new_room = zone["radius"] - distance(point, zone["center"])
+                if new_room < min(1.0, room):
+                    continue
+                gx, gy = unit(goal[0] - x, goal[1] - y)
+                toward = min(12, distance(point, goal))
+                onward = self.arena.walk_fraction(point, gx * toward, gy * toward, *clearance)
+                if onward < 0.55:
+                    # Keep easing along the wall if this corner does not yet
+                    # give a straight route to the destination.
+                    if self.arena.walk_fraction(point, ux * 7, uy * 7, *clearance) < 0.99:
+                        continue
+                score = (8 * onward + 0.34 * (current - distance(point, goal))
+                         - 0.08 * length + 0.5 * across * self.side)
+                if score > best_score:
+                    best, best_score = point, score
+        if best is not None:
+            self.bypass = best, goal, now + 2.1
         return best
 
     def hazards(self, obs):
@@ -221,10 +308,15 @@ class Movement:
         dx, dy = unit(goal[0] - pos[0], goal[1] - pos[1]) if traveling else (0, 0)
 
         if self.anchor is None or now - self.anchor_t >= 0.9:
-            if self.anchor and self.was_traveling and traveling and distance(pos, self.anchor) < 2.4:
+            same_goal = (goal is not None and self.anchor_goal is not None
+                         and distance(goal, self.anchor_goal) < 4)
+            no_progress = same_goal and distance(self.anchor, goal) - goal_distance < 1.7
+            stopped = self.anchor is not None and distance(pos, self.anchor) < 2.4
+            if self.was_traveling and traveling and (stopped or no_progress and self.bypass is None):
                 self.recover_until = now + 1.65
                 self.side *= -1
             self.anchor = pos
+            self.anchor_goal = goal
             self.anchor_t = now
             self.was_traveling = traveling
         if not traveling and not hazards and not beams:
@@ -297,6 +389,16 @@ class Movement:
 
         # Outside combat the clear direct route is usually optimal.
         direct_clear = self.arena.walk_fraction(pos, dx * reach, dy * reach, radius, height, step)
+        in_danger = bool(beams or hazards and hazards[0][1] < 0.28)
+        if traveling and me["grounded"] and not attack and not in_danger:
+            if direct_clear < 0.99 or self.bypass:
+                detour = self.bypass_goal(obs, goal, (dx, dy), direct_clear)
+                if detour is not None:
+                    dx, dy = unit(detour[0] - pos[0], detour[1] - pos[1])
+                    reach = min(reach, max(3.0, distance(pos, detour)))
+                    direct_clear = self.arena.walk_fraction(pos, dx * reach, dy * reach, radius, height, step)
+        elif attack:
+            self.bypass = None
         alert_near = bool(alert is not None and alert.age(now) < 1.8 and alert.distance < 120)
         if (direct_clear == 1 and traveling and not hazards and not threats and not beams
                 and ring is None and not alert_near and now >= self.recover_until):
@@ -313,7 +415,9 @@ class Movement:
                     # Closing is worthwhile when both mechs have similar arc
                     # range. The aim layer can still fire while we strafe.
                     hostile_arc = min(hostile_arc, 22)
-                origins.append((origin, distance(pos, origin), hostile_arc))
+                before = distance(pos, origin)
+                covered = not shared_duel and before < 120 and not self.arena.clear(origin, torso)
+                origins.append((origin, before, hostile_arc, covered))
             if attack:
                 ax, ay, az = attack["pos"]
                 avx, avy, avz = attack.get("vel", (0, 0, 0))
@@ -355,14 +459,18 @@ class Movement:
                     center, ring_radius = ring
                     score -= 2.3 * max(0, distance(endpoint, center) - max(0, ring_radius - 1))
 
-                for origin, before, hostile_arc in origins:
+                for origin, before, hostile_arc, covered in origins:
                     after = distance(endpoint, origin)
                     if mode == "retreat" and travel > 2 and after < 135:
                         if not self.arena.clear(origin, endpoint):
                             score += 2.5
+                        elif covered:
+                            score -= 3.5
                         score += 0.11 * (after - before)
                     else:
                         score -= 0.19 * max(0, 20 - after)
+                        if covered and travel > 2 and after < 120 and self.arena.clear(origin, endpoint):
+                            score -= 2.6 if attack else 3.4
                     if attack or mode == "retreat":
                         score -= 0.17 * max(0, hostile_arc + 3 - after) if hostile_arc else 0
                 if attack:
@@ -398,10 +506,18 @@ class Movement:
         ux, uy, fraction = best
         stalled = traveling and (fraction < 0.31 or now < self.recover_until and fraction < 0.65)
         if stalled and me["grounded"] and energy > 30:
-            action["jump"] = True
-            self.jet_until = now + 0.85
-        if stalled and fraction < 0.18:
-            ux, uy = dx, dy
+            # Require room above the hull and a reachable path at jump
+            # height. Avoid spending jets against tall walls and overhangs.
+            x, y, z = pos
+            for lift in (2.5, 4.4):
+                head = x, y, z + height
+                if not self.arena.clear(head, (x, y, head[2] + lift)):
+                    break
+                raised = x, y, z + lift
+                if self.arena.walk_fraction(raised, ux * 5, uy * 5, radius, height, step) >= 0.99:
+                    action["jump"] = True
+                    self.jet_until = now + 0.60
+                    break
         self.last_heading = (ux, uy)
         action["move"] = [ux, uy]
         action["boost"] = bool(ground_boost or not me["grounded"] and now < self.jet_until and energy > 18)
