@@ -386,7 +386,17 @@ class Bot:
                     and (cover is None or distance(pos, cover) > me["stats"]["walk_speed"] * 0.9)
                     and hp < danger * 2.0 + burst):
                 return cover, "breakout", target, None
-            return cover, "retreat", None, None
+            # Retreat is not the same as switching off the gun.  A nearby
+            # pursuer is already committed; fire back while opening distance
+            # or using cover.  The escaping flag still forbids a new laser
+            # charge, so this does not slow the retreat.
+            defensive = None
+            visible = [foe for _, _, foe in threats]
+            if visible:
+                candidate = min(visible, key=lambda foe: distance(pos, foe["pos"]))
+                if distance(pos, candidate["pos"]) < 140:
+                    defensive = candidate
+            return cover, "retreat", defensive, None
 
         # An unseen close sound is evidence, not a target.  Do not keep farming
         # or walking into it; back off while the scan layer looks toward it.
