@@ -1,6 +1,8 @@
 """Bounded local steering, cover selection, and projectile avoidance."""
 import math
 
+from kinematics import flight_delta, planar_delta
+
 
 def distance(a, b):
     return math.hypot(a[0] - b[0], a[1] - b[1])
@@ -27,6 +29,9 @@ class Movement:
         self.recover_until = 0
         self.boost_until = 0
         self.jet_until = 0
+        self.jet_height = 0
+        self.jump_at = -math.inf
+        self.strafe_offset = hello["slot"] * 0.43
 
     def enemy_arc_range(self, target):
         if "lightning" not in target.get("weapons", ()):
@@ -71,7 +76,10 @@ class Movement:
         x, y = unit(tx - pos[0], ty - pos[1])
         predicted_range = math.hypot(tx - pos[0], ty - pos[1])
         radial = max(-1, min(1, (predicted_range - preferred) / 19))
-        tangent = self.side * (0.89 if abs(radial) < 0.7 else 0.56)
+        strafe = self.side
+        if not retreat and not finish and abs(radial) < 0.55:
+            strafe *= 1 if math.sin((obs["t"] + self.strafe_offset) * 2.0) >= 0 else -1
+        tangent = strafe * (0.89 if abs(radial) < 0.7 else 0.56)
         if finish and d > preferred + 6:
             radial, tangent = 1.0, self.side * 0.12
         elif retreat:
@@ -174,6 +182,27 @@ class Movement:
                            6.8 if shell else 2.7, (sx, sy)))
         return sorted(danger)[:8]
 
+    def climb_clear(self, pos, stats, direction, rise):
+        x, y, z = pos[0], pos[1], pos[2] + stats["height"]
+        dx, dy = direction
+        return self.arena.clear((x, y, z), (x, y, z + rise)) and self.arena.clear(
+            (x, y, z + 0.2), (x + dx * 1.1, y + dy * 1.1, z + rise)
+        )
+
+    def jumping_dodge(self, me, hazards, direction, speed):
+        pos, stats = me["pos"], me["stats"]
+        vx, vy, _ = me["vel"]
+        for _, t, point, radius, severity, _ in hazards:
+            if severity > 3 or t < 0.13:
+                continue
+            dx, dy = planar_delta(vx, vy, direction[0] * speed, direction[1] * speed,
+                                  stats["ground_accel"], t)
+            already_missed = math.hypot(point[0] - pos[0] - dx, point[1] - pos[1] - dy) > radius
+            rise = flight_delta(stats["jump_speed"], -stats["gravity"], stats["max_rise_speed"], t)
+            if not already_missed and pos[2] - 0.5 < point[2] < pos[2] + rise - 0.45:
+                return self.climb_clear(pos, stats, direction, max(1.3, rise))
+        return False
+
     @staticmethod
     def beam_margin(point, beam, height):
         origin, cos, sin, slope, reach = beam
@@ -270,8 +299,18 @@ class Movement:
                         and goal_distance > 30 and energy > 52)
         fight_boost = (traveling and mode == "fight" and attack is not None
                        and not arc_active and engagement_distance > 55
+                       and not (secondary and secondary["kind"] == "laser" and secondary["cooldown"] < 0.35)
                        and energy > reserve + 15)
         dodge_boost = bool(hazards and me["grounded"] and energy > 30)
+        quiet = (mode in ("travel", "caution", "cube", "weapon") and near > 44
+                 and not hazards and not beams and alert is not None
+                 and alert.age(now) < 1.5 and alert.distance <= 100)
+        if quiet:
+            # Slowing down is useful only while outside the known firing lanes.
+            quiet = not any(
+                self.arena.clear((p[0], p[1], p[2] + 7), torso)
+                for p in (foe["pos"] for foe in threats)
+            )
         boost_wanted = (
             traveling and mode in ("zone", "retreat", "caution") and energy > 34
             or travel_boost
@@ -282,7 +321,7 @@ class Movement:
             and goal_distance > 17 and energy > 65
             or dodge_boost
         )
-        if laser_busy:
+        if laser_busy or quiet:
             # Charging already halves speed; do not also drain boost energy.
             self.boost_until = 0
         elif boost_wanted and energy > boost_floor:
@@ -291,6 +330,12 @@ class Movement:
         speed = stats["boost_speed"] if ground_boost else stats["walk_speed"]
         if laser_busy:
             speed *= stats.get("charge_move_mult", self.config["mech"].get("charge_move_mult", 0.5))
+        pace = 1.0
+        if quiet:
+            pace = min(pace, self.config.get("sound", {}).get("step_speed", 5) * 0.90 / speed)
+        if traveling and mode in ("weapon", "cube", "drop") and not hazards and not beams:
+            pace = min(pace, max(0.28, (goal_distance - stop_radius) / 8.0))
+        speed *= pace
         reach = min(14, max(3, speed * 0.76), max(3, goal_distance))
         max_score, best = -math.inf, (dx, dy, 0)
         room = zone["radius"] - distance(pos, zone["center"])
@@ -304,7 +349,7 @@ class Movement:
         else:
             last_x, last_y = self.last_heading
             origins = []
-            for foe in threats:
+            for foe in enemies[:3]:
                 px, py, pz = foe["pos"]
                 origin = (px, py, pz + 8)
                 hostile_arc = self.enemy_arc_range(foe)
@@ -313,7 +358,9 @@ class Movement:
                     # Closing is worthwhile when both mechs have similar arc
                     # range. The aim layer can still fire while we strafe.
                     hostile_arc = min(hostile_arc, 22)
-                origins.append((origin, distance(pos, origin), hostile_arc))
+                before = distance(pos, origin)
+                covered = before < 130 and not self.arena.clear(origin, torso)
+                origins.append((origin, before, hostile_arc, covered, shared_duel))
             if attack:
                 ax, ay, az = attack["pos"]
                 avx, avy, avz = attack.get("vel", (0, 0, 0))
@@ -327,14 +374,8 @@ class Movement:
                 attack_facing = math.cos(yaw), math.sin(yaw)
             accel = stats["ground_accel"] if me["grounded"] else stats["air_accel"]
             turn = 0.5 * accel / max(1, speed)
-            # Acceleration is common to all headings. Keep only the steering-dependent term
-            # inside the candidate loop.
-            predictions = []
-            for _, t, hit, safe, severity, _ in hazards:
-                gain = min(1.0, t * turn)
-                predictions.append((hit[0] - pos[0] - t * vx * (1 - gain),
-                                    hit[1] - pos[1] - t * vy * (1 - gain),
-                                    t, safe, severity))
+            predictions = [(hit[0] - pos[0], hit[1] - pos[1], t, safe, severity)
+                           for _, t, hit, safe, severity, _ in hazards]
             beam_gain = min(1.0, 0.36 * turn)
             for along, across in ANGLES:
                 ux, uy = dx * along - dy * across, dy * along + dx * across
@@ -355,11 +396,17 @@ class Movement:
                     center, ring_radius = ring
                     score -= 2.3 * max(0, distance(endpoint, center) - max(0, ring_radius - 1))
 
-                for origin, before, hostile_arc in origins:
+                for origin, before, hostile_arc, covered, shared_duel in origins:
                     after = distance(endpoint, origin)
-                    if mode == "retreat" and travel > 2 and after < 135:
-                        if not self.arena.clear(origin, endpoint):
-                            score += 2.5
+                    if travel > 2 and after < 130 and (mode == "retreat" or covered or (attack and not shared_duel)):
+                        occluded = not self.arena.clear(origin, endpoint)
+                        if mode == "retreat" and occluded:
+                            score += 2.5 if not covered else 1.0
+                        elif covered and not occluded:
+                            score -= 2.7 if shared_duel else 4.2
+                        elif not occluded and attack and not shared_duel:
+                            score -= 1.25
+                    if mode == "retreat":
                         score += 0.11 * (after - before)
                     else:
                         score -= 0.19 * max(0, 20 - after)
@@ -385,23 +432,26 @@ class Movement:
                         score -= 0.35 * max(0, radius + 5 - self.beam_margin(endpoint, beam, height))
 
                 for x, y, t, safe, severity in predictions:
-                    # The candidate can displace at most speed * t (and only
-                    # as far as the clear fraction allows).  This used to be a
-                    # dimensionless gain*fraction, which capped the dodge at
-                    # one metre regardless of speed or warning time.
-                    available = min(t, reach / max(1.0, speed)) * speed * fraction
-                    margin = math.hypot(x - ux * available, y - uy * available) - safe
+                    step_x, step_y = planar_delta(vx, vy, ux * speed * fraction, uy * speed * fraction, accel, t)
+                    margin = math.hypot(x - step_x, y - step_y) - safe
                     score -= severity * max(0, 1 - margin / max(1, safe))
                 if score > max_score:
                     max_score, best = score, (ux, uy, fraction)
 
         ux, uy, fraction = best
         stalled = traveling and (fraction < 0.31 or now < self.recover_until and fraction < 0.65)
-        if stalled and me["grounded"] and energy > 30:
-            action["jump"] = True
-            self.jet_until = now + 0.85
         if stalled and fraction < 0.18:
             ux, uy = dx, dy
+        if me["grounded"] and now - self.jump_at >= 0.9:
+            hurdle = stalled and energy > 29 and self.climb_clear(pos, stats, (ux, uy), 3.4)
+            dodge = hazards and not beams and self.jumping_dodge(me, hazards, (ux, uy), speed)
+            if hurdle or dodge:
+                action["jump"] = True
+                self.jump_at = now
+                self.jet_until = now + 1.10 if hurdle else now
+                self.jet_height = pos[2] + 6.5
+        flying = (not me["grounded"] and traveling and now < self.jet_until and pos[2] < self.jet_height
+                  and energy > reserve and fraction < 0.95 and self.climb_clear(pos, stats, (ux, uy), 2.2))
         self.last_heading = (ux, uy)
-        action["move"] = [ux, uy]
-        action["boost"] = bool(ground_boost or not me["grounded"] and now < self.jet_until and energy > 18)
+        action["move"] = [ux * pace, uy * pace]
+        action["boost"] = bool(ground_boost and not action.get("jump") or flying)
