@@ -329,6 +329,8 @@ class Combat:
         else:
             events = self._combine_schedules(me, schedules, horizon)
         events.sort()
+        if not events:
+            return Engagement()
         hp = target.get("hp") or target.get("max_hp") or 1400
         dealt = 0.0
         kill_time = math.inf

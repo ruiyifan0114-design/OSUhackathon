@@ -130,7 +130,7 @@ class Bot:
         secondary = me["weapons"][1]
         enemies = sorted((x for x in obs["mechs"] if x["kind"] == "mech"),
                          key=lambda x: distance(pos, x["pos"]))
-        nearby = [x for x in enemies if distance(pos, x["pos"]) < 140]
+        nearby = [x for x in enemies if distance(pos, x["pos"]) < 190]
         zone_goal, urgent = self.zone_goal(obs)
         threats = self.threats(obs, nearby)
         alert = self.awareness.alert(now)
@@ -293,7 +293,7 @@ class Bot:
         ranked = []
         for foe in enemies[:4]:
             d = distance(pos, foe["pos"])
-            if d > 170 or urgent and d > 55:
+            if d > 190 or urgent and d > 55:
                 break
             estimate = self.combat.estimate(obs, foe)
             if not math.isfinite(estimate.first_shot):
@@ -314,10 +314,21 @@ class Bot:
         reserve = me["max_hp"] * (0.09 if obs["alive"] <= 3 else 0.16)
         burst = sum(amount for _, amount, _ in threats)
         rate_by_id = {foe["id"]: rate for rate, _, foe in threats}
+
+        def zone_safe(foe):
+            # When the next circle is about to move, do not commit to a kill
+            # that lies outside it.  After the move there is still time to
+            # take an opportunistic shot without chasing.
+            return (
+                zone["shrink_end"] - now > 25
+                or distance(foe["pos"], zone["next_center"])
+                <= max(0, zone["next_radius"] - 8)
+            )
+
         finish = None
         best_finish = -math.inf
         for score, foe, eta in ranked:
-            if eta.kill_time > 2.3:
+            if eta.kill_time > 2.3 or not zone_safe(foe):
                 continue
             # Count incoming fire until the kill, then only fire from survivors.
             remaining_rate = max(0, danger - rate_by_id.get(foe["id"], 0))
@@ -338,7 +349,11 @@ class Bot:
             travel = max(0, distance(pos, goal) - drop["radius"]) / me["stats"]["walk_speed"]
             progress = drop["progress"] if drop["holder"] == me["id"] else 0
             duration = max(travel, drop["lands_in"]) + max(0, drop["capture_s"] - progress)
-            if not contested and (danger * duration < hp * 0.62 or exposed == 0):
+            sound_clear = (alert is None or alert.age(now) > 1.8
+                           or alert.distance > 110)
+            if (not contested and sound_clear
+                    and (danger * duration < hp * 0.55
+                         or exposed == 0 and danger < 20)):
                 return goal, "drop", target, (drop["pos"], drop["radius"])
             mode, goal, resource = "travel", zone_goal, None
 
@@ -401,8 +416,9 @@ class Bot:
             late = obs["alive"] <= 4 or zone["next_radius"] <= 70
             incoming = danger * min(kill_time, 2.2) + burst * 0.6
             affordable = hp - incoming > reserve and hp > me["max_hp"] * 0.26
-            if ((affordable and close) or (weak and close)
-                    or (late and affordable and d < preferred + 25)):
+            if (zone_safe(target)
+                    and ((affordable and close) or (weak and close)
+                         or (late and affordable and d < preferred + 25))):
                 return self.movement.engage(obs, target, preferred, False, zone_goal), "fight", target, None
             # Not worth crossing open ground for.  Keep the objective and let
             # the aim layer take only shots that are already available.
@@ -458,12 +474,15 @@ class Bot:
         center = zone["next_center"]
         radius = zone["next_radius"]
         d = distance(pos, center)
-        speed = me["stats"]["walk_speed"] * 0.62
-        required = max(0, d - max(0, radius - 18)) / speed
+        # Use a conservative effective speed: the local steering has to route
+        # around buildings and may have to jump or wait for a clear lane.  A
+        # straight-line estimate at full walk speed chronically starts too late.
+        speed = me["stats"]["walk_speed"] * 0.48
+        required = max(0, d - max(0, radius - 20)) / speed
         urgent = (
             not me["in_zone"]
-            or zone_room < (12 if now >= zone["shrink_start"] else 1)
-            or required > max(3, zone["shrink_end"] - now - 12)
+            or zone_room < (14 if now >= zone["shrink_start"] else 1)
+            or required > max(3, zone["shrink_end"] - now - 15)
             or radius == 0 and zone["shrink_end"] - now < 10
         )
         if d <= 2 or radius <= 15:
@@ -491,6 +510,11 @@ class Bot:
             if d > radius or distance(point, zone["center"]) > zone["radius"] - 8:
                 return
             if mode != "drop" and abs(point[2] - pos[2]) > 5:
+                return
+            # Do not chase loot or farm targets that are about to be outside
+            # the next circle.  Supply drops are already placed inside it.
+            if (mode != "drop" and zone["shrink_end"] - now < 30
+                    and distance(point, zone["next_center"]) > zone["next_radius"] - 8):
                 return
             threat = min((distance(point, e["pos"]) for e in nearby), default=150)
             danger = max(0, 38 - threat) * (2.6 if self.recovering else 1.25)
