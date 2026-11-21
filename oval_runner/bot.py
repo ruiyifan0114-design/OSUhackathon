@@ -481,7 +481,7 @@ class Bot:
     def weapon_ratings(self, obs, enemies):
         small = obs["zone"]["next_radius"] <= 70
         has_mortar_enemy = any("mortar" in e.get("weapons", ()) for e in enemies[:3])
-        ratings = {"gun": 0, "mortar": 5.1, "laser": 4.4, "lightning": 6.0}
+        ratings = {"gun": 0, "mortar": 6.3, "laser": 4.4, "lightning": 6.0}
         # A squad that shares vision often converges in pairs.  Splash and
         # chain damage gain value exactly when two or more targets are close.
         visible = enemies[:6]
