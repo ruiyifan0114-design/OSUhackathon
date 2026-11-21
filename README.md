@@ -13,8 +13,6 @@ The bot uses only the Python standard library and runs as an unprivileged user o
 - **Map-aware combat**: reads the arena height field and building/bridge prisms, traces shots through cover, and validates local movement against walls and ledges.
 - **Predictive weapons**: leads gun targets, arcs mortar shells, charges/releases lasers, and schedules both weapon slots around one torso.
 - **Sound awareness**: keeps a short recency-weighted memory of gunfire, jets, footsteps, laser charges, and other sounds; turns to scan unseen threats, backs away from close contacts, and can use a nearby sound as a coarse lightning target.
-- **Three-phase survival**: early game avoids voluntary long-range duels, mid game takes opportunistic fights, and the final circle becomes aggressive; weapon preferences change with the phase.
-- **Anti-laser discipline**: breaks line of sight against laser carriers, refuses to charge its own laser while exposed, and falls back to lateral escape when no cover is reachable.
 - **Survival first**: disengages to cover at low HP or against multiple threats, avoids long open-ground chases, values wounded/isolated targets, and uses zone timing and supply drops.
 - **Config-driven upgrades**: values an offer from its `hello.config.upgrades` effect paths instead of a hard-coded id list, including `lightning_chain`, `laser_pierce`, and `mortar_velocity`.
 - **Projectile evasion**: uses warning time and speed in metres (not a dimensionless gain) to choose lateral movement away from bullets and mortar splash.

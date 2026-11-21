@@ -68,7 +68,6 @@ class Bot:
         self.movement = Movement(hello, self.arena)
         self.awareness = Awareness(hello)
         self.upgrade_defs = {item["id"]: item for item in self.config.get("upgrades", ())}
-        self.phase = "mid"
         self.recovering = False
         self.hit_rate = 0
         self.last_time = 0
@@ -122,19 +121,8 @@ class Bot:
             if key not in visible and (now - seen > 16 or distance(pos, item["pos"]) < 8):
                 del self.loot[key]
 
-    @staticmethod
-    def phase_for(obs):
-        """Early avoids voluntary duels, late plays for the final circle."""
-        zone = obs["zone"]
-        if obs["alive"] <= 4 or zone["next_radius"] <= 70 or obs["t"] >= 400:
-            return "late"
-        if obs["alive"] >= 9 and obs["t"] < 180:
-            return "early"
-        return "mid"
-
     def act(self, obs):
         self.update(obs)
-        self.phase = self.phase_for(obs)
         me = obs["self"]
         pos = me["pos"]
         now = obs["t"]
@@ -150,22 +138,12 @@ class Bot:
         danger = max(self.hit_rate, sum(rate for rate, _, _ in threats),
                      sound_pressure * 0.55)
         exposed = len(threats)
-        laser = self.laser_threat(threats, obs)
         hp_fraction = me["hp"] / me["max_hp"]
-        if self.phase == "early":
-            low = 0.62 if exposed > 1 else 0.52
-            high = 0.82 if exposed else 0.78
-        elif self.phase == "late":
-            low = 0.50 if exposed > 1 else 0.40
-            high = 0.68 if exposed else 0.64
-        else:
-            low = 0.57 if exposed > 1 else 0.44
-            high = 0.77 if exposed else 0.70
         if zone["next_radius"] == 0 and zone["shrink_end"] - now < 8:
             self.recovering = False
-        elif hp_fraction < low or danger * 2.4 > me["hp"]:
+        elif hp_fraction < (0.57 if exposed > 1 else 0.44) or danger * 2.4 > me["hp"]:
             self.recovering = True
-        elif hp_fraction >= high:
+        elif hp_fraction >= (0.77 if exposed else 0.70):
             self.recovering = False
 
         action = {}
@@ -185,7 +163,7 @@ class Bot:
 
         goal, mode, target, ring = self.plan(
             obs, enemies, nearby, threats, danger, zone_goal, urgent,
-            ratings, rating, alert, laser,
+            ratings, rating, alert,
         )
         if mode in ("fight", "finish", "breakout"):
             self.combat_target = target["id"]
@@ -202,16 +180,11 @@ class Bot:
             scan = math.atan2(goal[1] - pos[1], goal[0] - pos[0]) + 0.50 * math.sin(now * 1.25)
         else:
             scan = me["aim"][0] + 0.31
-        escaping = mode in ("zone", "retreat", "breakout", "laser_break")
-        # Charging our own laser while exposed to an enemy laser is a losing
-        # trade: it slows us down and telegraphs the beam.  Keep the gun or a
-        # covered secondary instead.
-        suppress_laser = bool(laser and (laser[1] or laser[2] < 180))
-        self.combat.apply(action, obs, target, scan,
-                          allow_new_charge=not escaping and not suppress_laser)
+        escaping = mode in ("zone", "retreat", "breakout")
+        self.combat.apply(action, obs, target, scan, allow_new_charge=not escaping)
         if target is None and not escaping and alert is not None:
             self.blind_lightning(action, obs, alert)
-        if secondary and secondary["kind"] == "laser" and (escaping or suppress_laser):
+        if secondary and secondary["kind"] == "laser" and escaping:
             action["fire"][1] = False
         steering_mode = "retreat" if mode == "breakout" else mode
         self.movement.apply(action, obs, goal, steering_mode, nearby,
@@ -267,53 +240,6 @@ class Bot:
         action["aim"] = [alert.bearing, 0.0]
         action["fire"][1] = True
 
-    def laser_threat(self, threats, obs):
-        """Find visible laser carriers; only exposed threats reach this list."""
-        foes = [foe for _, _, foe in threats if "laser" in foe.get("weapons", ())]
-        if not foes:
-            return None
-        pos = obs["self"]["pos"]
-        return foes, any(foe.get("charging") for foe in foes), min(
-            distance(pos, foe["pos"]) for foe in foes
-        )
-
-    def should_break_laser(self, obs, laser):
-        if laser is None:
-            return False
-        _, charging, distance = laser
-        if charging:
-            return True
-        # Early game is for staying alive, not for testing a laser duel.
-        if self.phase == "early":
-            return distance < 155
-        if self.phase == "mid":
-            return distance < 115
-        return distance < 65
-
-    def laser_escape(self, obs, foe, zone_goal):
-        """Fallback when no reachable cover exists: move across the beam."""
-        me = obs["self"]
-        pos = me["pos"]
-        zone = obs["zone"]
-        bearing = math.atan2(foe["pos"][1] - pos[1], foe["pos"][0] - pos[0])
-        cos, sin = math.cos(bearing), math.sin(bearing)
-        stats = me["stats"]
-        candidates = (
-            (pos[0] + 22 * sin, pos[1] - 22 * cos),
-            (pos[0] - 22 * sin, pos[1] + 22 * cos),
-            (pos[0] - 22 * cos, pos[1] - 22 * sin),
-        )
-        for x, y in candidates:
-            if distance((x, y), zone["center"]) > zone["radius"] - 8:
-                continue
-            if self.arena.walk_fraction(
-                    pos, x - pos[0], y - pos[1], stats["radius"],
-                    stats["height"], stats["step_up"]) == 1.0:
-                return x, y, pos[2]
-        if distance(pos, zone_goal) > 12:
-            return zone_goal
-        return pos[0] - 18 * cos, pos[1] - 18 * sin, pos[2]
-
     def threats(self, obs, nearby):
         """Rank exposed opponents by sustained pressure and telegraphed burst."""
         me = obs["self"]
@@ -352,7 +278,7 @@ class Bot:
                       (25 if entry[2]["id"] == recent_attacker else 0), reverse=True)
 
     def plan(self, obs, enemies, nearby, threats, danger, zone_goal, urgent,
-             ratings, rating, alert, laser=None):
+             ratings, rating, alert):
         me = obs["self"]
         pos = me["pos"]
         now = obs["t"]
@@ -363,25 +289,11 @@ class Bot:
         goal, resource, mode = self.objective(obs, zone_goal, urgent, nearby, ratings, rating)
         exposed = len(threats)
 
-        # Zone urgency and laser suppression are handled before the expensive
-        # target ranking: they need no combat estimate and save a few ms.
-        if urgent:
-            return zone_goal, "zone", None, None
-
-        if (laser is not None and not self.recovering
-                and self.should_break_laser(obs, laser)):
-            foes = laser[0]
-            cover = self.retreat_cover(obs, foes, zone_goal)
-            if cover is None or distance(cover, pos) < 1.5:
-                cover = self.laser_escape(obs, foes[0], zone_goal)
-            return cover, "laser_break", foes[0], None
-
         # Spend the short-horizon combat estimate on nearby, plausible opponents.
-        limit = 3 if self.phase == "early" else 4
         ranked = []
-        for foe in enemies[:limit]:
+        for foe in enemies[:4]:
             d = distance(pos, foe["pos"])
-            if d > 190:
+            if d > 190 or urgent and d > 55:
                 break
             estimate = self.combat.estimate(obs, foe)
             if not math.isfinite(estimate.first_shot):
@@ -396,9 +308,10 @@ class Bot:
                      + 34 * wounded + revenge + stick)
             ranked.append((score, foe, estimate))
         _, target, estimate = max(ranked, key=lambda item: item[0], default=(0, None, None))
+        if urgent:
+            return zone_goal, "zone", target, None
 
-        reserve_rate = {"early": 0.22, "mid": 0.16, "late": 0.08}[self.phase]
-        reserve = me["max_hp"] * reserve_rate
+        reserve = me["max_hp"] * (0.09 if obs["alive"] <= 3 else 0.16)
         burst = sum(amount for _, amount, _ in threats)
         rate_by_id = {foe["id"]: rate for rate, _, foe in threats}
 
@@ -417,10 +330,6 @@ class Bot:
         for score, foe, eta in ranked:
             if eta.kill_time > 2.3 or not zone_safe(foe):
                 continue
-            if self.phase == "early":
-                foe_hp = foe.get("hp") or foe.get("max_hp") or 1400
-                if distance(pos, foe["pos"]) > 55 or foe_hp > me["max_hp"] * 0.62:
-                    continue
             # Count incoming fire until the kill, then only fire from survivors.
             remaining_rate = max(0, danger - rate_by_id.get(foe["id"], 0))
             loss = danger * eta.kill_time + remaining_rate * 0.55 + burst
@@ -442,11 +351,9 @@ class Bot:
             duration = max(travel, drop["lands_in"]) + max(0, drop["capture_s"] - progress)
             sound_clear = (alert is None or alert.age(now) > 1.8
                            or alert.distance > 110)
-            drop_limit = 0.40 if self.phase == "early" else 0.55
-            quiet_limit = 10 if self.phase == "early" else 20
             if (not contested and sound_clear
-                    and (danger * duration < hp * drop_limit
-                         or exposed == 0 and danger < quiet_limit)):
+                    and (danger * duration < hp * 0.55
+                         or exposed == 0 and danger < 20)):
                 return goal, "drop", target, (drop["pos"], drop["radius"])
             mode, goal, resource = "travel", zone_goal, None
 
@@ -505,20 +412,13 @@ class Bot:
             kill_time = estimate.kill_time if estimate and math.isfinite(estimate.kill_time) else 2.5
             target_hp = target.get("hp") or target.get("max_hp") or 1400
             weak = target_hp <= max(90, me["max_hp"] * 0.34) or kill_time <= 1.10
-            if self.phase == "early":
-                close = d <= 45
-                late = False
-            elif self.phase == "late":
-                close = d <= max(60, preferred + 32)
-                late = True
-            else:
-                close = d <= max(48, preferred + 24)
-                late = obs["alive"] <= 5
+            close = d <= max(48, preferred + 24)
+            late = obs["alive"] <= 4 or zone["next_radius"] <= 70
             incoming = danger * min(kill_time, 2.2) + burst * 0.6
             affordable = hp - incoming > reserve and hp > me["max_hp"] * 0.26
             if (zone_safe(target)
                     and ((affordable and close) or (weak and close)
-                         or (late and affordable and d < preferred + 35))):
+                         or (late and affordable and d < preferred + 25))):
                 return self.movement.engage(obs, target, preferred, False, zone_goal), "fight", target, None
             # Not worth crossing open ground for.  Keep the objective and let
             # the aim layer take only shots that are already available.
@@ -551,19 +451,13 @@ class Bot:
         mf.draw.label(f"{mode}:{target_id} k{self.kills} dmg{int(self.damage_done)}/{int(self.damage_taken)} w{weapon} f{kill}")
 
     def weapon_ratings(self, obs, enemies):
+        small = obs["zone"]["next_radius"] <= 70
         has_mortar_enemy = any("mortar" in e.get("weapons", ()) for e in enemies[:3])
-        if self.phase == "early":
-            # In the open, range and cover matter more than the lightning
-            # cone.  Do not force a close-range duel before the lobby thins.
-            ratings = {"gun": 0, "mortar": 5.6, "laser": 6.2, "lightning": 4.8}
-        elif self.phase == "late":
-            ratings = {"gun": 0, "mortar": 5.2, "laser": 5.0, "lightning": 7.2}
-        else:
-            ratings = {"gun": 0, "mortar": 5.4, "laser": 5.8, "lightning": 5.8}
-        if obs["zone"]["next_radius"] <= 70:
-            ratings["lightning"] += 1.0
+        ratings = {"gun": 0, "mortar": 5.1, "laser": 4.4, "lightning": 6.0}
+        if small:
+            ratings["lightning"] += 2
         elif has_mortar_enemy:
-            ratings["laser"] += 1.0
+            ratings["laser"] += 1.6
         for upgrade in obs["self"]["upgrades"]:
             prefix = upgrade.split("_", 1)[0]
             if prefix in ratings and prefix != "gun":
