@@ -210,7 +210,9 @@ class Movement:
             if self.beam_margin(torso, beam, height) < radius + 8 and self.arena.clear(origin, torso):
                 beams.append(beam)
         goal_distance = distance(pos, goal) if goal is not None else 0
-        stop_radius = {"farm": 18, "drop": 2.5, "cube": 1.8, "weapon": 2.5}.get(mode, 1.4)
+        # High-speed arrivals need a little more braking distance; pickup
+        # radii are 3.5-4 m, so these still stop inside them.
+        stop_radius = {"farm": 18, "drop": 3.2, "cube": 2.6, "weapon": 3.2}.get(mode, 2.0)
         if mode == "farm" and goal is not None:
             eye = (pos[0], pos[1], pos[2] + stats["muzzle_height"])
             if not self.arena.clear(eye, (goal[0], goal[1], goal[2] + 1.25)):
@@ -251,23 +253,43 @@ class Movement:
                 dx, dy = (1, 0)
 
         energy = me["energy"]
+        fire = action.get("fire", (False, False))
+        laser_busy = any(
+            w and w["kind"] == "laser" and (w.get("charge", 0) > 0 or trigger)
+            for w, trigger in zip(me["weapons"], fire)
+        )
         near = distance(pos, threats[0]["pos"]) if threats else math.inf
         engagement_distance = distance(pos, attack["pos"]) if attack else near
         arc_opening = self.enemy_arc_range(attack) if attack else 0
         closing = arc_active and mode == "fight" and own_arc + 3 < engagement_distance < 85
         closing_energy = 68 if arc_opening else 52
-        reserve = 32 if lightning else 22
+        reserve = 44 if lightning else 28
+        boost_floor = max(18, reserve * 0.55)
         chasing = mode == "finish" and engagement_distance > (own_arc * 0.77 if arc_active else 28)
-        if (traveling and mode in ("zone", "retreat", "caution") and energy > 32 or
-                traveling and closing and energy > closing_energy or
-                traveling and chasing and energy > reserve + 9 or
-                traveling and mode in ("weapon", "drop") and near < 110 and goal_distance > 17 and energy > 77):
+        travel_boost = (traveling and mode == "travel"
+                        and goal_distance > 30 and energy > 52)
+        fight_boost = (traveling and mode == "fight" and attack is not None
+                       and not arc_active and engagement_distance > 55
+                       and energy > reserve + 15)
+        dodge_boost = bool(hazards and me["grounded"] and energy > 30)
+        boost_wanted = (
+            traveling and mode in ("zone", "retreat", "caution") and energy > 34
+            or travel_boost
+            or fight_boost
+            or traveling and closing and energy > closing_energy
+            or traveling and chasing and energy > reserve + 9
+            or traveling and mode in ("weapon", "drop") and near < 110
+            and goal_distance > 17 and energy > 65
+            or dodge_boost
+        )
+        if laser_busy:
+            # Charging already halves speed; do not also drain boost energy.
+            self.boost_until = 0
+        elif boost_wanted and energy > boost_floor:
             self.boost_until = max(self.boost_until, now + 0.18)
-        ground_boost = me["grounded"] and now < self.boost_until and energy > 15
+        ground_boost = me["grounded"] and now < self.boost_until and energy > boost_floor
         speed = stats["boost_speed"] if ground_boost else stats["walk_speed"]
-        fire = action.get("fire", (False, False))
-        if any(w and w["kind"] == "laser" and (w.get("charge", 0) > 0 or trigger)
-               for w, trigger in zip(me["weapons"], fire)):
+        if laser_busy:
             speed *= stats.get("charge_move_mult", self.config["mech"].get("charge_move_mult", 0.5))
         reach = min(14, max(3, speed * 0.76), max(3, goal_distance))
         max_score, best = -math.inf, (dx, dy, 0)
