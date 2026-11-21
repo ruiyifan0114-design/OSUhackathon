@@ -86,8 +86,6 @@ class Bot:
         self.damage_done = self.damage_taken = self.kills = 0
         self.laser_cooldown = {}
         self.last_attacker = None
-        self.kill_reset_until = 0.0
-        self.last_target_pos = None
 
     def update(self, obs):
         now = obs["t"]
@@ -107,7 +105,6 @@ class Bot:
                 self.damage_done += event["amount"]
             elif kind == "kill":
                 self.kills += 1
-                self.kill_reset_until = now + 1.2
                 if self.first_kill is None:
                     self.first_kill = now
             elif kind == "took" and event["kind"] != "gun" and self.first_weapon is None:
@@ -170,8 +167,6 @@ class Bot:
             obs, enemies, nearby, threats, danger, zone_goal, urgent,
             ratings, rating, alert,
         )
-        if target is not None:
-            self.last_target_pos = list(target["pos"])
         if mode in ("fight", "finish", "breakout"):
             self.combat_target = target["id"]
         else:
@@ -295,26 +290,6 @@ class Bot:
         nearest = distance(pos, enemies[0]["pos"]) if enemies else math.inf
         goal, resource, mode = self.objective(obs, zone_goal, urgent, nearby, ratings, rating)
         exposed = len(threats)
-        close_threats = [foe for _, _, foe in threats
-                         if distance(pos, foe["pos"]) < 115]
-        duel_ok = len(close_threats) <= 1
-
-        if urgent:
-            return zone_goal, "zone", None, None
-
-        # A kill changes the squad's pressure. Leave the lane before looking
-        # for the next target instead of immediately drawing the next bot in.
-        if now < self.kill_reset_until:
-            foes = [foe for _, _, foe in threats][:2]
-            cover = self.retreat_cover(obs, foes, zone_goal) if foes else None
-            if cover is None and self.last_target_pos is not None:
-                bearing = math.atan2(pos[1] - self.last_target_pos[1],
-                                       pos[0] - self.last_target_pos[0])
-                cover = (pos[0] - 20 * math.cos(bearing),
-                         pos[1] - 20 * math.sin(bearing), pos[2])
-            elif cover is None and distance(pos, zone_goal) > 12:
-                cover = zone_goal
-            return cover, "reset", None, None
 
         # Spend the short-horizon combat estimate on nearby, plausible opponents.
         ranked = []
@@ -326,7 +301,7 @@ class Bot:
             estimate = self.combat.estimate(obs, foe)
             if not math.isfinite(estimate.first_shot):
                 continue
-            stick = 18 if foe["id"] == self.combat_target else 0
+            stick = 10 if foe["id"] == self.combat_target else 0
             foe_hp = foe.get("hp") or foe.get("max_hp") or 1400
             foe_max = foe.get("max_hp") or 1400
             wounded = 1 - min(1.0, foe_hp / max(1.0, foe_max))
@@ -348,6 +323,8 @@ class Bot:
                      + room_bonus - crowd_penalty)
             ranked.append((score, foe, estimate))
         _, target, estimate = max(ranked, key=lambda item: item[0], default=(0, None, None))
+        if urgent:
+            return zone_goal, "zone", target, None
 
         reserve = me["max_hp"] * (0.09 if obs["alive"] <= 3 else 0.16)
         burst = sum(amount for _, amount, _ in threats)
@@ -369,9 +346,6 @@ class Bot:
             foe_hp = foe.get("hp") or foe.get("max_hp") or 1400
             finish_window = (2.8 if foe_hp <= me["max_hp"] * 0.55
                              or isolation_by_id.get(foe["id"], 0) > 45 else 2.3)
-            d = distance(pos, foe["pos"])
-            if (not duel_ok and not (foe_hp <= me["max_hp"] * 0.28 and d < 60)):
-                continue
             if eta.kill_time > finish_window or not zone_safe(foe):
                 continue
             # Count incoming fire until the kill, then only fire from survivors.
@@ -436,22 +410,11 @@ class Bot:
             # charge, so this does not slow the retreat.
             defensive = None
             visible = [foe for _, _, foe in threats]
-            if visible and duel_ok:
+            if visible:
                 candidate = min(visible, key=lambda foe: distance(pos, foe["pos"]))
                 if distance(pos, candidate["pos"]) < 140:
                     defensive = candidate
             return cover, "retreat", defensive, None
-
-        # Even at high HP, intentionally starting a fight while two squad bots
-        # already have a line is how a 1v1 turns into a 1v3.  Break contact
-        # first; only a nearly dead, very close target is worth the exception.
-        if not duel_ok and threats:
-            immediate = [foe for _, _, foe in threats]
-            cover = self.retreat_cover(obs, immediate, zone_goal)
-            if cover is None or distance(cover, pos) < 1.5:
-                target = min(immediate, key=lambda foe: distance(pos, foe["pos"]))
-                cover = self.movement.engage(obs, target, 70, True, zone_goal)
-            return cover, "retreat", None, None
 
         # An unseen close sound is evidence, not a target.  Do not keep farming
         # or walking into it; back off while the scan layer looks toward it.
@@ -481,8 +444,6 @@ class Bot:
             late = obs["alive"] <= 4 or zone["next_radius"] <= 70
             incoming = danger * min(kill_time, 2.2) + burst * 0.6
             affordable = hp - incoming > reserve and hp > me["max_hp"] * 0.26
-            if (not duel_ok and not (weak and d < 65)):
-                return goal, mode, None, None
             if (zone_safe(target)
                     and ((affordable and close) or (weak and close)
                          or (late and affordable and d < preferred + 25))):
