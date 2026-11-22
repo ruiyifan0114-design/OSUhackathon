@@ -516,7 +516,7 @@ class Bot:
         # Use a conservative effective speed: the local steering has to route
         # around buildings and may have to jump or wait for a clear lane.  A
         # straight-line estimate at full walk speed chronically starts too late.
-        speed = me["stats"]["walk_speed"] * 0.42
+        speed = me["stats"]["walk_speed"] * 0.48
         required = max(0, d - max(0, radius - 20)) / speed
         urgent = (
             not me["in_zone"]
