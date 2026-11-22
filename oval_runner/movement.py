@@ -1,4 +1,5 @@
 """Bounded local steering, cover selection, and projectile avoidance."""
+import heapq
 import math
 
 
@@ -13,6 +14,88 @@ def unit(x, y):
 
 ANGLES = tuple((math.cos(a), math.sin(a)) for a in
                (0, 0.36, -0.36, 0.74, -0.74, 1.17, -1.17, 1.57, -1.57, 2.18, -2.18, math.pi))
+DETOUR_MODES = frozenset(("travel", "zone", "weapon", "cube", "farm", "drop"))
+DETOUR_STEPS = ((1, 0), (-1, 0), (0, 1), (0, -1),
+                (1, 1), (1, -1), (-1, 1), (-1, -1))
+
+
+class _Detour:
+    """Incremental ground search, used only after local steering stalls."""
+
+    spacing = 8.0
+
+    def __init__(self, arena, pos, goal, stats, zone, stop_radius):
+        self.arena = arena
+        self.start = pos[:2]
+        self.goal = goal[:2]
+        self.profile = tuple(stats[key] for key in ("radius", "height", "step_up"))
+        self.objective_radius = stop_radius
+        self.center = zone["center"]
+        self.radius = zone["radius"]
+        self.zone_floor = min(-2, self.radius - distance(pos, self.center) - 2)
+        self.start_distance = distance(pos, goal)
+        self.bounds = min(105, max(64, self.start_distance + 32))
+        self.nodes = {(0, 0): (pos, 0.0, None)}
+        self.open = [(self.start_distance, 0.0, (0, 0))]
+        self.terrain = {}
+        self.expanded = 0
+
+    def clear(self, start, goal):
+        dx, dy = goal[0] - start[0], goal[1] - start[1]
+        first_step = 1 / max(1, math.hypot(dx, dy))
+        return (self.arena.walk_fraction(start, dx * first_step, dy * first_step, *self.profile) == 1.0
+                and self.arena.walk_fraction(start, dx, dy, *self.profile) == 1.0)
+
+    def path(self, key, endpoint=None):
+        steps = [endpoint] if endpoint is not None else []
+        while key != (0, 0):
+            point, _, key = self.nodes[key]
+            steps.append(point)
+        return list(reversed(steps))
+
+    def advance(self):
+        """Return a waypoint list on success, an empty list on failure, or None while searching."""
+        for _ in range(11):
+            if not self.open or self.expanded >= 200:
+                return []
+            _, cost, key = heapq.heappop(self.open)
+            point, known, _ = self.nodes[key]
+            if cost != known:
+                continue
+            self.expanded += 1
+            d = distance(point, self.goal)
+            if key != (0, 0) and d < 20 and self.clear(point, self.goal):
+                return self.path(key, self.goal)
+            if key != (0, 0) and d <= self.objective_radius:
+                return self.path(key)
+            if d < self.start_distance - 28:
+                dx, dy = unit(self.goal[0] - point[0], self.goal[1] - point[1])
+                ahead = (point[0] + dx * 23, point[1] + dy * 23)
+                if self.clear(point, ahead):
+                    return self.path(key)
+            for ix, iy in DETOUR_STEPS:
+                neighbor = key[0] + ix, key[1] + iy
+                if math.hypot(*neighbor) * self.spacing > self.bounds:
+                    continue
+                x = self.start[0] + neighbor[0] * self.spacing
+                y = self.start[1] + neighbor[1] * self.spacing
+                room = self.radius - distance((x, y), self.center)
+                if room < self.zone_floor:
+                    continue
+                new_cost = cost + self.spacing * math.hypot(ix, iy) + max(0, 4 - room) * 0.35
+                previous = self.nodes.get(neighbor)
+                if previous is not None and new_cost >= previous[1]:
+                    continue
+                if neighbor not in self.terrain:
+                    self.terrain[neighbor] = self.arena.ground(x, y)
+                z = self.terrain[neighbor]
+                if z is None or not self.clear(point, (x, y)):
+                    continue
+                next_point = (x, y, z)
+                self.nodes[neighbor] = next_point, new_cost, key
+                heapq.heappush(self.open, (new_cost + 1.12 * distance(next_point, self.goal),
+                                           new_cost, neighbor))
+        return None
 
 
 class Movement:
@@ -27,6 +110,70 @@ class Movement:
         self.recover_until = 0
         self.boost_until = 0
         self.jet_until = 0
+        self.nav_goal = None
+        self.nav_mode = None
+        self.nav_distance = math.inf
+        self.nav_check_at = 0
+        self.nav_stall = 0
+        self.nav_retry_at = 0
+        self.nav_search = None
+        self.nav_path = []
+        self.nav_expires = 0
+
+    def detour_waypoint(self, obs, goal, mode, goal_distance, stop_radius):
+        me = obs["self"]
+        pos = me["pos"]
+        now = obs["t"]
+        if (mode != self.nav_mode or self.nav_goal is None or goal is None
+                or distance(goal, self.nav_goal) > 8):
+            self.nav_goal, self.nav_mode = goal, mode
+            self.nav_distance, self.nav_check_at = goal_distance, now + 1.1
+            self.nav_stall, self.nav_retry_at = 0, now
+            self.nav_search, self.nav_path = None, []
+            return None
+        if self.nav_path and now < self.nav_expires:
+            while self.nav_path and distance(pos, self.nav_path[0]) < 2.1:
+                self.nav_path.pop(0)
+            if self.nav_path:
+                stats = me["stats"]
+                for i in range(min(2, len(self.nav_path) - 1), -1, -1):
+                    point = self.nav_path[i]
+                    if self.arena.walk_fraction(
+                        pos, point[0] - pos[0], point[1] - pos[1],
+                        stats["radius"], stats["height"], stats["step_up"],
+                    ) == 1.0:
+                        self.nav_path = self.nav_path[i:]
+                        return point
+                return self.nav_path[0]
+        if self.nav_path:
+            self.nav_path = []
+        if self.nav_search is not None:
+            route = self.nav_search.advance()
+            if route is None:
+                return None
+            self.nav_search = None
+            self.nav_distance, self.nav_check_at = goal_distance, now + 1.1
+            self.nav_stall, self.nav_retry_at = 0, now + 4
+            if route:
+                self.nav_path, self.nav_expires = route, now + 22
+                return self.nav_path[0]
+            return None
+        if now < self.nav_check_at or now < self.nav_retry_at:
+            return None
+        self.nav_stall = self.nav_stall + 1 if self.nav_distance - goal_distance < 2.8 else 0
+        self.nav_distance, self.nav_check_at = goal_distance, now + 1.1
+        if self.nav_stall < 2 or not me["grounded"]:
+            return None
+        ground = self.arena.ground(*pos[:2])
+        if ground is None or abs(ground - pos[2]) > 1.4:
+            return None
+        stats = me["stats"]
+        search = _Detour(self.arena, pos, goal, stats, obs["zone"], stop_radius)
+        if not search.clear(pos, goal):
+            self.nav_search = search
+        else:
+            self.nav_retry_at = now + 2
+        return None
 
     def enemy_arc_range(self, target):
         if "lightning" not in target.get("weapons", ()):
@@ -218,7 +365,15 @@ class Movement:
             if not self.arena.clear(eye, (goal[0], goal[1], goal[2] + 1.25)):
                 stop_radius = 2
         traveling = goal_distance > stop_radius
-        dx, dy = unit(goal[0] - pos[0], goal[1] - pos[1]) if traveling else (0, 0)
+        waypoint = None
+        if traveling and mode in DETOUR_MODES:
+            waypoint = self.detour_waypoint(obs, goal, mode, goal_distance, stop_radius)
+        elif self.nav_goal is not None:
+            self.nav_goal, self.nav_search, self.nav_path = None, None, []
+        steering_goal = waypoint or goal
+        dx, dy = unit(steering_goal[0] - pos[0], steering_goal[1] - pos[1]) if traveling else (0, 0)
+        if waypoint is not None and ring is not None and distance(pos, ring[0]) > ring[1]:
+            ring = None
 
         if self.anchor is None or now - self.anchor_t >= 0.9:
             if self.anchor and self.was_traveling and traveling and distance(pos, self.anchor) < 2.4:
@@ -291,7 +446,8 @@ class Movement:
         speed = stats["boost_speed"] if ground_boost else stats["walk_speed"]
         if laser_busy:
             speed *= stats.get("charge_move_mult", self.config["mech"].get("charge_move_mult", 0.5))
-        reach = min(14, max(3, speed * 0.76), max(3, goal_distance))
+        steering_distance = distance(pos, waypoint) if waypoint else goal_distance
+        reach = min(14, max(3, speed * 0.76), max(3, steering_distance))
         max_score, best = -math.inf, (dx, dy, 0)
         room = zone["radius"] - distance(pos, zone["center"])
 
@@ -327,8 +483,6 @@ class Movement:
                 attack_facing = math.cos(yaw), math.sin(yaw)
             accel = stats["ground_accel"] if me["grounded"] else stats["air_accel"]
             turn = 0.5 * accel / max(1, speed)
-            # Acceleration is common to all headings. Keep only the steering-dependent term
-            # inside the candidate loop.
             predictions = []
             for _, t, hit, safe, severity, _ in hazards:
                 gain = min(1.0, t * turn)
@@ -385,10 +539,6 @@ class Movement:
                         score -= 0.35 * max(0, radius + 5 - self.beam_margin(endpoint, beam, height))
 
                 for x, y, t, safe, severity in predictions:
-                    # The candidate can displace at most speed * t (and only
-                    # as far as the clear fraction allows).  This used to be a
-                    # dimensionless gain*fraction, which capped the dodge at
-                    # one metre regardless of speed or warning time.
                     available = min(t, reach / max(1.0, speed)) * speed * fraction
                     margin = math.hypot(x - ux * available, y - uy * available) - safe
                     score -= severity * max(0, 1 - margin / max(1, safe))

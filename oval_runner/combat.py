@@ -118,6 +118,19 @@ class Combat:
             if flight is None or flight > ttl:
                 return None
         ex, ey, ez = dx + velocity[0] * flight, dy + velocity[1] * flight, dz + velocity[2] * flight
+        if projectile_speed and velocity[2] < -1 and self.arena is not None:
+            # Linear lead can put a falling target's feet below the terrain
+            # before impact. Re-solve at the landing altitude in that case.
+            floor = self.arena.ground(origin[0] + ex, origin[1] + ey)
+            feet = origin[2] + ez - height * aim_at
+            if floor is not None and feet < floor - 0.25:
+                landed_dz = floor + height * aim_at - origin[2]
+                level = (velocity[0], velocity[1], 0)
+                landed_flight = self._lead(dx, dy, landed_dz, level, projectile_speed, offset, gravity, ttl)
+                if landed_flight is not None and landed_flight <= ttl:
+                    flight = landed_flight
+                    ex, ey = dx + velocity[0] * flight, dy + velocity[1] * flight
+                    ez = max(dz + velocity[2] * flight, landed_dz)
         horiz = math.hypot(ex, ey)
         distance = math.hypot(horiz, ez)
         if kind == "lightning" and distance > stats["range"]:
@@ -154,7 +167,11 @@ class Combat:
     def _shot(self, me, target, weapon, latency):
         shot = self._solution(me, target, weapon, latency, 0.52)
         if shot is None and weapon["kind"] in ("gun", "laser"):
-            shot = self._solution(me, target, weapon, latency, 0.83)
+            # A bridge or lip may hide the upper body while leaving the legs
+            # exposed. Preserve center and upper-body aim whenever available.
+            shot = self._solution(me, target, weapon, latency, 0.83) or self._solution(
+                me, target, weapon, latency, 0.22
+            )
         return shot
 
     def _frame_shot(self, obs, target, weapon):
