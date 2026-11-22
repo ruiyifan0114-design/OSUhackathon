@@ -315,8 +315,8 @@ class Bot:
             # The practice squad shares vision and does not fight itself.
             # A target separated from its squad is the only kind of fight
             # that can be converted into a clean kill.
-            room_bonus = 9.0 * min(1.0, isolation / 55.0)
-            crowd_penalty = 7.0 if isolation < 22 else 0.0
+            room_bonus = 14.0 * min(1.0, isolation / 55.0)
+            crowd_penalty = 11.0 if isolation < 22 else 0.0
             score = (0.58 * estimate.damage_1s + 165 / (0.75 + estimate.kill_time)
                      - 0.29 * d - 19 * min(2, estimate.first_shot)
                      + 34 * wounded + revenge + stick
