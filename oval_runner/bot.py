@@ -326,7 +326,7 @@ class Bot:
         if urgent:
             return zone_goal, "zone", target, None
 
-        reserve = me["max_hp"] * (0.09 if obs["alive"] <= 3 else 0.16)
+        reserve = me["max_hp"] * (0.09 if obs["alive"] <= 3 else 0.12)
         burst = sum(amount for _, amount, _ in threats)
         rate_by_id = {foe["id"]: rate for rate, _, foe in threats}
 
