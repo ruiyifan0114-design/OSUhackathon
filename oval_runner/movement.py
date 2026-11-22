@@ -267,7 +267,7 @@ class Movement:
         boost_floor = max(18, reserve * 0.55)
         chasing = mode == "finish" and engagement_distance > (own_arc * 0.77 if arc_active else 28)
         travel_boost = (traveling and mode == "travel"
-                        and goal_distance > 30 and energy > 52)
+                        and goal_distance > 30 and energy > 42)
         fight_boost = (traveling and mode == "fight" and attack is not None
                        and not arc_active and engagement_distance > 55
                        and energy > reserve + 15)
