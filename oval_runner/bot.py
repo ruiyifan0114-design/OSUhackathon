@@ -344,8 +344,8 @@ class Bot:
         best_finish = -math.inf
         for score, foe, eta in ranked:
             foe_hp = foe.get("hp") or foe.get("max_hp") or 1400
-            finish_window = (3.1 if foe_hp <= me["max_hp"] * 0.55
-                             or isolation_by_id.get(foe["id"], 0) > 45 else 2.6)
+            finish_window = (2.8 if foe_hp <= me["max_hp"] * 0.55
+                             or isolation_by_id.get(foe["id"], 0) > 45 else 2.3)
             if eta.kill_time > finish_window or not zone_safe(foe):
                 continue
             # Count incoming fire until the kill, then only fire from survivors.
